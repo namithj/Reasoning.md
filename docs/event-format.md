@@ -1,53 +1,89 @@
-# Normalized event contract v1
+# Import custom events
 
-`reasoning import` without `--host` accepts UTF-8 JSONL: one event object per line. Blank lines are ignored. This is the recorder's own interchange format, not any host's transcript format. A caller must already have legitimately accessible conversation content; the recorder never reconstructs hidden or missing messages.
+Use this guide if you are building an exporter or already have conversation data to import. For an assistant's own transcript, start with [explicit imports](adapters.md#explicit-imports).
 
-```json
-{
-  "schema_version": 1,
-  "source": {
-    "tool": "codex",
-    "session_id": "session-123",
-    "event_id": "source-event-4",
-    "surface": "extension",
-    "host_version": null,
-    "extension_version": null,
-    "locator": "session-export:4"
-  },
-  "task_id": "task-123",
-  "sequence": 3,
-  "timestamp": "2026-09-07T12:00:03Z",
-  "type": "tool_result",
-  "content": "1 test passed.",
-  "tool_call_id": "call-1",
-  "model": null
-}
+Reasoning.md accepts UTF-8 JSONL: one JSON event per line. Save this example as `events.jsonl`:
+
+```jsonl
+{"schema_version":1,"source":{"tool":"manual","session_id":"session-1","event_id":"message-1","surface":"import","locator":"my-export:1"},"task_id":"task-1","sequence":0,"type":"user_message","content":"Keep the existing API compatible."}
 ```
 
-Required fields: `schema_version`, `source`, `task_id`, `sequence`, `type`, and `content`. Within `source`, `tool`, `session_id`, `event_id`, `surface`, and `locator` are required. `timestamp`, model/version fields and `tool_call_id` default to null. Identifiers are 1–160 characters, starting with a letter or digit and using letters, digits, `.`, `_`, `:`, `/` or `-`. Content is a string; explicitly serialize structured tool payloads as text. Unknown fields and schema versions fail the entire batch. Error messages do not echo malformed source content.
+From your initialized Git project, run:
 
-`source.tool` is `claude-code`, `codex`, `copilot`, `chatgpt`, legacy `copilot-vscode`, or `manual`; it describes the source, not a promise of an enabled native adapter. `surface` is `extension`, `cli`, `desktop` or `import`. Use null for unavailable runtime, extension and model versions. `tool_call_id` links a result to its call when exposed by the source.
+```sh
+reasoning import --input events.jsonl
+reasoning status
+```
 
-Event types:
+Import saves pending local history. Follow the [commit guide](controlled-commits.md) to include it in Git.
 
-- `user_message`
-- `assistant_message`
-- `tool_call`
-- `tool_result`
-- `explicit_decision`
-- `compaction_boundary`
-- `capture_gap`
-- `imported_content`
+## Required fields
 
-Assign a stable source event ID and sequence from the source. Never generate a new ID every time an event is replayed. Repeated messages with different source IDs remain distinct events. Sequences are non-negative safe integers, unique within a tool/session and monotonically ordered in exported records. Late events can be imported out of order and fill gaps. A compaction summary should be labelled as such inside a `compaction_boundary`; it does not replace missing messages.
+| Field | Value |
+| --- | --- |
+| `schema_version` | `1` |
+| `source.tool` | `claude-code`, `codex`, `copilot`, `chatgpt`, `manual`, or legacy `copilot-vscode` |
+| `source.session_id` | Stable ID for the source conversation |
+| `source.event_id` | Stable ID for this event within the conversation |
+| `source.surface` | `extension`, `cli`, `desktop` or `import` |
+| `source.locator` | Text describing where the event came from; up to 1,024 characters |
+| `task_id` | ID of the task this event belongs to |
+| `sequence` | Non-negative safe integer; unique within the tool/session |
+| `type` | One of the event types below |
+| `content` | Text content; serialize structured tool output as a string |
 
-The recorder derives its stable event ID from the tool, source session ID and source event ID. It ignores surface/version/locator changes when deduplicating a resumed session. A replay with different normalized content, task, sequence, timestamp, model or tool-call ID fails without modifying the journal. Changes that redact to identical normalized content are intentionally indistinguishable. Session event identity is deduplicated within a worktree; cross-worktree session transfer is not supported yet.
+IDs must be 1–160 characters, start with a letter or digit, and contain only letters, digits, `.`, `_`, `:`, `/` or `-`.
 
-Stored events add repository, worktree and environment identities and a redaction report. Machine identifiers are opaque hashes; no environment dump is included. Exports group sessions in first-observed order and sort by source sequence within each session. This does not imply a global chronology across independently running assistants.
+## Optional fields
 
-Snapshot manifests contain the selected event boundary, session ranges, observed versions and event types, known gaps, staged paths, staged-code fingerprint, redaction summary and SHA-256 hashes of `reasoning.txt` and `events.jsonl`. The manifest has no containing-commit hash and does not hash itself. Generated record paths are excluded from the code fingerprint. Paths are redacted for display when a credential pattern is detected; the fingerprint still uses the actual Git diff.
+Omitted optional fields default to `null`.
 
-All nonempty snapshots are `partial`: explicit imports cannot prove full host capture. An empty journal is `unavailable`, never `no_assistant_activity`. No command emits `complete_for_declared_scope` until a native source and its frozen boundary are verified. Standalone snapshots have no commit association or previous-record references. Controlled commit records set `snapshot: false` and reference earlier records for the same task. Only an explicit `--no-assistant-activity` attestation can produce that status; it is never inferred. The commit message references the record UUID, while the containing commit hash is stored only in the rebuildable local index.
+| Field | Value |
+| --- | --- |
+| `timestamp` | ISO 8601 timestamp with a timezone, such as `2026-09-07T12:00:00Z`; up to 40 characters |
+| `model` | Model name; up to 160 characters |
+| `tool_call_id` | ID linking a tool result to its call; follows the ID rules above |
+| `source.host_version` | Assistant version; up to 160 characters |
+| `source.extension_version` | Extension version; up to 160 characters |
 
+Use `null` when the source does not expose a value. Unknown fields and unsupported schema versions reject the entire batch without changing the journal.
 
-Native adapters normalize into the same contract. `capture_sources` records configured parser versions and declared host metadata; `queued_capture_deliveries` records excluded deliveries. Neither field certifies capture. `capture_override` is null unless the caller supplied an explicit partial-coverage reason during controlled commit preparation. The readable record includes that reason. Hook-derived sequences preserve capture arrival when late transcript records arrive; see [adapter source limits](adapters.md).
+## Event types
+
+| Type | Use for |
+| --- | --- |
+| `user_message` | A visible user prompt |
+| `assistant_message` | A visible assistant reply |
+| `tool_call` | An exposed tool invocation |
+| `tool_result` | An exposed tool result |
+| `explicit_decision` | A decision recorded in words |
+| `compaction_boundary` | A source compaction marker; label any generated summary clearly |
+| `capture_gap` | Known missing or unsupported content |
+| `imported_content` | Other accessible conversation text |
+
+Only import content you actually have. Do not invent missing messages or label inferred reasoning as a captured exchange.
+
+## Repeated and late events
+
+Keep the same tool, session ID and source event ID when importing an event again. An unchanged replay is ignored. Identical text with a different source event ID is treated as a separate event.
+
+A replay that changes normalized content, task, sequence, timestamp, model or tool-call ID is rejected without changing the journal. Surface, version and locator changes do not create a new event. Changes that redact to identical normalized content are indistinguishable.
+
+Late events may arrive out of order. Imported records sort by source sequence within each session; there is no guaranteed global timeline across assistants. Keep sequence numbers stable and do not transfer a live session between worktrees.
+
+## Privacy and limits
+
+- Import batches are limited to 5 MiB; blank lines are ignored.
+- Common credentials are filtered, and oversized content is shortened to the event limit of 16,384 characters.
+- Binary content and environment dumps receive omission markers.
+- The journal is limited to 32 MiB per worktree. An import that would exceed it is rejected.
+
+Filtering does not guarantee that confidential information is removed. Review the record before committing or sharing it.
+
+## Saved records
+
+Stored events include additional repository, worktree, environment and redaction metadata. These generated fields are not accepted as custom input fields; use the input format above when writing an exporter.
+
+Each record contains readable text, events and a manifest describing its event boundary, gaps, file hashes and association with staged code. Controlled commit records can reference earlier records for the same task. Standalone exports are snapshots with no commit association.
+
+Assistant capture and imports are currently `partial`. Empty history is `unavailable`. Only an explicit commit-time attestation can produce `no_assistant_activity`; it is never inferred from an empty import. Parser/version metadata and coverage overrides do not certify complete capture.

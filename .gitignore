@@ -6,3 +6,5 @@ node_modules/
 release/
 
 /docs/private/
+.agents/skills/reasoning-md/SKILL.md
+.codex/hooks.json

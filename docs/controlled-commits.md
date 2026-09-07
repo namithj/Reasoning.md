@@ -1,63 +1,125 @@
-# Commits and recovery
+# Save conversations with commits
 
-Node 24+ and Git 2.43+ are required. The tested workflow is an ordinary staged local development commit, including an unborn branch, partial staging and linked worktrees. Existing executable hooks, rejection, modified staging, and real process termination before/after commit creation have Linux tests.
+Use `reasoning commit` to save a conversation record alongside your staged code changes. You need Node.js 24+, Git 2.43+ and an [initialized project with capture or imported history](adapters.md).
 
-## Controlled wrapper
+## Make a commit
+
+Stage your intended changes and include the configuration on the first commit:
 
 ```sh
 reasoning reconcile
-git add .ai-history/config.json path/to/your-change
-reasoning preview --staged --task TASK_ID
-reasoning commit -m "Describe the change" --task TASK_ID
+git add .ai-history/config.json path/to/changed-file
+reasoning preview --staged
+```
+
+Replace the file path with your own. Review the preview for private information and missing exchanges, then commit:
+
+```sh
+reasoning commit -m "Describe your change"
 reasoning verify HEAD
 reasoning show HEAD
 ```
 
-These are explicit user-run actions. The policy must be staged and match the working configuration. The wrapper stages only its three new record files alongside the user's existing staging. Preview is advisory: commit creates a fresh UUID and event boundary. Standalone snapshot exports and modifications to prior record files must not be staged; preparation rejects them.
+Reasoning.md adds its record files to your staged changes, preserves unstaged edits and runs existing Git hooks. It does not push anything. If you change the Reasoning.md configuration later, stage that change before committing too.
 
-For a manual change, `--no-assistant-activity` is an explicit attestation. It is rejected when selected events or any undrained capture delivery remain. Empty capture without the flag stays unavailable. Reconciliation runs before preparation, and late deliveries belong to a later record.
+If more than one task is present, use `reasoning task list` to find the right ID and add `--task TASK_ID` to both preview and commit.
 
-## Native hooks
+For work done without an assistant, you can explicitly attest to that:
 
-`reasoning hooks install` explicitly installs repository-local `core.hooksPath` configuration affecting linked worktrees. Ordinary staged `git commit` then prepares the same kind of record, inserts its trailer and verifies the candidate before the reference update. The active task is selected when one was explicitly started. Multiple independent tasks require the wrapper's `--task` selection.
+```sh
+reasoning commit -m "Update the copyright year" --no-assistant-activity
+```
 
-The installer saves the previous setting and delegates existing executable hooks. Record-related hooks run through the recorder; unrelated standard hooks such as `pre-push` pass through with arguments and stdin. Existing scripts are not edited. `reasoning hooks uninstall` restores the saved local setting, and refuses to overwrite a setting changed since installation. Resolve pending transactions in every linked worktree before uninstalling. Hooks reference the installed CLI path, so moving/removing that installation requires reconfiguration.
+The command rejects this flag if relevant pending events or queued capture deliveries remain. An empty history alone does not establish that no assistant was used.
 
-The wrapper remains usable while native integration is installed. Its own hooks use a command-scoped path and delegate to the saved original directory, preventing recursive recorder invocation. No automatic push occurs. The VS Code staged Commit action needs the separate [real-client capture check](adapters.md#verify-capture); terminal tests are not proof of the editor action.
+## Read and verify a record
 
-## Transaction and hook checks
+```sh
+reasoning show HEAD
+reasoning verify HEAD
+```
 
-Preparation freezes event IDs, writes an immutable three-file archive, verifies staged bytes against it, and saves a durable transaction with parent, branch, prepared tree and file hashes. Existing hooks execute with their original arguments. After the message hook, the recorder checks that HEAD, index and trailer still match. The reference-transaction prepared hook verifies the candidate commit before the branch update. Git's normal signing configuration remains in effect; interactive signing has not been exercised.
+Replace `HEAD` with another commit to inspect older work. These commands work from a fresh clone without the original assistant account.
 
-A rejecting or modifying hook stops the attempt. Cleanup removes only exact unchanged recorder-owned files from staging and disk. Code edits from another hook remain for review. Changed generated files retain the transaction for manual recovery; they are never silently deleted. Recursive commit hooks, arbitrary hook-manager internals and newer Git `hook.*` configuration are unsupported; the latter is rejected by preparation to avoid duplicate invocation. [Git hook runner](https://git-scm.com/docs/git-hook), [Git hooks](https://git-scm.com/docs/githooks).
+Records live under `.ai-history/records/`. Each contains readable `reasoning.txt`, structured `events.jsonl` and verification metadata in `manifest.json`. Keep this directory tracked. Later records reference earlier context instead of copying every exchange again.
 
-After Git succeeds, the recorder verifies the committed tree and trailer, writes a rebuildable record-to-commit index, and finalizes. Records in HEAD determine which event IDs have already been archived, making boundaries branch-dependent. A new record references earlier records for the same task. Journals are retained.
+Verification checks the record's integrity and association with the committed changes. It does not prove that every message was captured or that statements in the conversation are true.
+
+Do not edit previously committed record files or stage standalone `reasoning export` snapshots as commit records. Use `reasoning commit` to create a new record.
+
+## Optional: use ordinary Git commits
+
+To attach records when you run an ordinary staged `git commit`, install native hooks:
+
+```sh
+reasoning hooks install
+```
+
+This changes the repository's local `core.hooksPath`, including linked worktrees, and delegates to your existing executable hooks. It does not edit those original scripts. The `reasoning commit` command remains available.
+
+Editor Commit buttons need their own test; terminal success does not establish editor compatibility. Use the wrapper when you need to select a task explicitly or supply a coverage override.
+
+To remove the integration:
+
+```sh
+reasoning hooks uninstall
+```
+
+Resolve pending transactions in every linked worktree first. Uninstall restores the saved setting and refuses to overwrite a different hook configuration. Reinstall if you move the Node or CLI installation.
 
 ## Verification and coverage policy
 
-`verify COMMIT` checks exactly one final-paragraph trailer, a new primary record, three regular files, file hashes, the event boundary, retained earlier archives, same-repository references, and the staged-code fingerprint against the committed diff. `show` verifies and renders the primary and referenced records. Both work from a fresh clone without local journal state.
+Start with the default `warn` policy. All assistant capture is currently `partial`; missing capture is `unavailable`.
 
-`reasoning policy --mode strict` updates the tracked policy; stage it before committing. Since no adapter is certified complete, strict mode accepts only explicit no-activity attestations or a wrapper override: `--allow-partial "why this reviewed partial record is acceptable"`. The reason is redacted and saved in the manifest and readable record. Native strict commits with partial capture stop; use the wrapper when an override is needed.
+For stricter enforcement:
 
-`verify-range BASE..HEAD` checks every commit in a two-dot range. `--require-complete` rejects partial/unavailable records; `--allow-overrides` additionally permits an explicit recorded reason. These are structural/policy checks, not proof of trustworthy statements or complete host capture.
+```sh
+reasoning policy --mode strict
+git add .ai-history/config.json
+```
+
+Strict mode blocks partial or unavailable records unless you explicitly accept the limitation:
+
+```sh
+reasoning commit -m "Describe your change" --allow-partial "Reviewed the captured discussion and its gaps"
+```
+
+The reason is saved with the record. Native Git commits cannot supply this override; use `reasoning commit`. Explicit no-assistant-activity attestations are also accepted when their checks pass.
+
+For team checks, verify all commits after `BASE` through `HEAD`:
+
+```sh
+reasoning verify-range BASE..HEAD
+```
+
+Add `--require-complete` to reject incomplete capture. Add `--allow-overrides` alongside it if your team accepts recorded coverage exceptions. No current adapter produces complete capture.
 
 ## Failure and crash recovery
+
+Start with:
 
 ```sh
 reasoning doctor
 reasoning recover
 ```
 
-After a crash, establish that the PID on the lock's recorded host **and its Git child** have stopped before removing only the stale lock at the state path reported by `doctor`. Recovery never steals a live lock. Do not delete the journal or transaction to clear an error.
+If the commit already succeeded, recovery finalizes its record without creating another commit. If the attempt failed and the branch is unchanged, it cleans up unchanged recorder-owned files and keeps the events pending. Review your staging before committing again.
 
-Recovery searches refs and reflogs for the pending record. A matching valid commit is finalized without creating another code commit. If none exists and HEAD is unchanged, only unchanged recorder-owned files/staging are removed; events remain pending. Moved HEAD, multiple matching commits, edited files and invalid state require review. Retain refs/reflogs while recovery is unresolved.
+A rejecting hook stops the commit. Changes made by hooks or users are kept for review. If files were edited, the branch moved or recovery cannot identify a single valid commit, resolve the reported conflict before retrying.
 
-Calling the wrapper while a transaction is pending performs only recovery. If that clears a failed attempt, review staging and invoke commit again. Queued hook deliveries and a pending capture batch replay separately during `reconcile`. Failed atomic writes can leave UUID `.tmp` files or `.pending-*` export directories; inspect them before removing them. Never delete the journal to clear a queue failure.
+If a stale lock blocks recovery, confirm that the recorded process **and its Git child** have stopped on the recorded host. Only then remove the stale lock at the state path reported by `doctor` and retry. Do not delete the journal or transaction to clear an error. Preserve refs and reflogs until recovery is resolved.
 
-## Unsupported operations and ceilings
+Run `reasoning reconcile` separately for queued capture deliveries. Pending history is local, so back it up before deleting a checkout or replacing a container.
 
-Amend/reuse-message commits, `-a`, path-limited/temporary-index commits, merges, rebase, cherry-pick, revert, GitHub merge/squash commits and arbitrary IDE clients are outside this alpha's supported capture workflow. Wrapper preparation rejects operation markers/unsupported options; native preparation rejects temporary indexes and amend/reuse messages. **Some Git operations bypass commit hooks altogether. Native installation is not a universal enforcement boundary.** CI must detect unrecorded or structurally incompatible commits. Do not assume a bypassed operation is covered because ordinary staged commits work.
+## Current limitations
 
-Replay-safe amendment/merge support is remaining implementation work, not a passed gate. Use a disposable pilot and ordinary staged commits while evaluating this candidate. The verifier deliberately rejects merge commits and mutated/reused archive records rather than claiming valid association.
+Use ordinary staged development commits while evaluating this preview. The following workflows are outside its supported commit flow:
 
-The journal rewrites at most 32 MiB under one worktree lock; manifest scans are linear in the archive. Segmented storage and an index are future upgrades for larger use. Node cannot fsync directories on Windows. Live shared state across machines, network-filesystem locking and split execution are unsupported.
+- Amend or reuse-message commits, `git commit -a`, and path-limited commits.
+- Merge, rebase, cherry-pick, revert, and GitHub merge or squash commits.
+- Recursive commit hooks, unsupported hook managers and newer Git `hook.*` configuration.
+- Shared live state across machines or network-filesystem locking.
+
+Some Git operations bypass hooks entirely. Installing native hooks does not make those operations covered; use CI checks to detect unrecorded commits. Interactive commit signing remains unverified.
+
+The local journal is limited to 32 MiB per worktree. There is no automatic pruning, and very large archives require increasing scan time.

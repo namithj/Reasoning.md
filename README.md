@@ -1,5 +1,7 @@
 # Reasoning.md
 
+Reasoning.md exists to preserve the context behind code changes. When you build software with an AI assistant, the questions, tradeoffs and decisions often stay in a chat while only the code reaches Git. This project saves the visible conversation and your decision notes alongside the commits they explain, helping you review changes, revisit earlier choices and hand work to another developer or assistant without reconstructing the discussion from scratch.
+
 The npm package is `@namithj/reasoning.md`; the command is `reasoning`.
 
 Save accessible development conversations alongside the Git commits they explain. Records contain readable text, structured events, source references and a fingerprint of the staged code. No cloud service, model call or external dependency is required.
@@ -8,56 +10,67 @@ Save accessible development conversations alongside the Git commits they explain
 
 ## Install
 
-Requires **Node.js 24+** and **Git 2.43+**. From a checkout of [namithj/Reasoning.md](https://github.com/namithj/Reasoning.md):
+Requires **Node.js 24+** and **Git 2.43+**.
+
+### Install from npm
+
+Install the preview release, then check that the command is available:
+
+```sh
+npm install --global @namithj/reasoning.md@next
+reasoning --version
+reasoning --help
+```
+
+### Alternative: build locally
+
+If the npm preview is unavailable or you want to build from source, download or clone [namithj/Reasoning.md](https://github.com/namithj/Reasoning.md). Open a terminal in the checkout directory containing `package.json`, then run:
 
 ```sh
 npm run build
-node dist/cli.js --help
 npm install --global .
+reasoning --version
 ```
 
-Or install the supplied compiled package with `npm install --global ./namithj-reasoning.md-0.1.0-alpha.3.tgz`. The build erases TypeScript types using Node; it does not perform static type checking.
+If you already have a compiled package, you can install it directly with `npm install --global ./namithj-reasoning.md-0.1.0-alpha.3.tgz`.
 
-Once the preview is published to npm, install it with `npm install --global @namithj/reasoning.md@next`.
+## How to Use
 
-## First repository
-
-Use a disposable repository for your first [capture check](docs/adapters.md#verify-capture). Run these commands yourself from the project whose conversation you intend to save:
+Open a terminal in your existing Git project and initialize it:
 
 ```sh
 reasoning init --publication private
-reasoning task start "Fix the greeting"
+```
+
+Use `--publication public` instead for records intended for public sharing. Then choose the setup for your assistant below (Linux or macOS).
+
+### Claude Code
+
+```sh
 reasoning adapter enable claude-code
 reasoning skill install --host claude-code
+```
+
+### Codex
+
+```sh
+reasoning adapter enable codex
+reasoning skill install --host codex
+```
+
+The adapter configures conversation capture; the skill gives your assistant instructions for using saved history. Reload your assistant as required by its hook settings, then check the setup:
+
+```sh
 reasoning doctor
 ```
 
-Select your actual host; see [adapter configuration and scope](docs/adapters.md). Task creation is optional: otherwise each unbound source session gets its own task. Explicitly bind sessions when several assistants work on one task. A configured adapter is not a verified adapter.
+`doctor` reports configuration and capture gaps; verify a real exchange with the [capture check](docs/adapters.md#verify-capture). On Windows, use [transcript imports](docs/adapters.md#explicit-imports) because automatic adapter setup is currently unavailable.
 
-After working in the assistant, stage the intended changes and inspect the record:
-
-```sh
-reasoning reconcile
-git add .ai-history/config.json path/to/your-change
-reasoning preview --staged --task TASK_ID
-reasoning commit -m "Fix the greeting" --task TASK_ID
-reasoning verify HEAD
-reasoning show HEAD
-```
-
-`reasoning commit` creates a commit only when invoked. It preserves partial staging and appends `Reasoning-Record: <uuid>` to the message. The commit includes:
-
-```text
-.ai-history/records/<uuid>/reasoning.txt
-.ai-history/records/<uuid>/events.jsonl
-.ai-history/records/<uuid>/manifest.json
-```
-
-New events are exported once per reachable archive; later records reference earlier context. `export --staged` produces a separate untracked snapshot, which must not be staged as a controlled commit record. No command pushes or publishes.
-
-To test ordinary staged `git commit`, explicitly install native integration with `reasoning hooks install`. It changes local `core.hooksPath` for the repository and linked worktrees, delegates existing executable hooks, and can be removed with `reasoning hooks uninstall`. **Use the [supported Git workflow](docs/controlled-commits.md); amend, merges, replay operations and temporary-index commits are outside this alpha's support.** A real IDE Commit action still needs its own test.
+When you are ready to save a conversation with your changes, follow the [commit guide](docs/controlled-commits.md).
 
 ## Retrieve the discussion
+
+Use `reasoning task list` to find the `TASK_ID` used below.
 
 ```sh
 reasoning decision "Keep the old API because existing callers depend on it" --task TASK_ID
@@ -68,6 +81,64 @@ reasoning show HEAD
 ```
 
 Context packets quote saved evidence and cite event/record IDs. They do not invent conclusions or execute historical instructions. Tracked history works on a fresh clone without the original assistant account. Pending local conversations do not travel with a clone.
+
+## Available commands
+
+In a terminal, commands show readable summaries, details and suggested next steps. When piped or redirected, they keep their existing JSON or text output for scripts. Choose a format explicitly when needed:
+
+```sh
+reasoning doctor --format text
+reasoning status --format json
+```
+
+`--format json` wraps the text reports from `show`, `preview` and `context` in a `text` field. Help and version output stay plain text; assistant hooks keep their stdout empty.
+
+Run these commands as `reasoning COMMAND` from your project's Git directory. Replace uppercase placeholders with your own values. Use `reasoning --help` for all options or `reasoning --version` to check the installed version.
+
+### Setup and health
+
+| Command | What it does |
+| --- | --- |
+| `init --publication private` | Initialize the project; use `public` for records intended for public sharing. |
+| `doctor` | Report configuration, assistant environment and capture gaps. |
+| `status` | Show captured events, sessions, queued deliveries and pending work. |
+| `adapter enable HOST` | Configure capture for an assistant. |
+| `adapter list` | List available adapters and their local configuration. |
+| `adapter check HOST --session ID --prompt "TEXT" --reply "TEXT"` | Check whether a known exchange and tool activity were captured. |
+| `skill install --host HOST` | Install instructions that help your assistant use saved history. |
+| `probe HOST` | Inspect the environment for assistant integration information. |
+
+### Capture and commits
+
+| Command | What it does |
+| --- | --- |
+| `import --input FILE` | Import events; add `--host HOST --session ID` for a supported assistant transcript. |
+| `capture HOST --input FILE` | Process an assistant hook payload; normally called by configured hooks. |
+| `reconcile` | Retry queued capture and read updates from known transcripts. |
+| `preview --staged` | Show the conversation record proposed for your staged changes. |
+| `commit -m "MESSAGE"` | Commit staged changes with their conversation record. |
+| `export --staged` | Write a standalone snapshot without staging or committing it. |
+| `verify COMMIT` | Check a record's integrity and association with a commit. |
+| `verify-range BASE..HEAD` | Check every commit in a range. |
+| `recover` | Recover an interrupted recorder commit. |
+| `hooks install` | Attach records to ordinary staged Git commits using local hooks. |
+| `hooks uninstall` | Remove native integration and restore the saved hook setting. |
+| `policy --mode strict` | Require acceptable capture coverage at commit time; use `warn` for the default policy. |
+
+### Tasks and saved history
+
+| Command | What it does |
+| --- | --- |
+| `task start "OBJECTIVE"` | Create a task and make it active for new sessions. |
+| `task list` | List tasks, their IDs and session bindings. |
+| `task bind TOOL SESSION --task ID` | Associate an assistant session with a task. |
+| `decision "RATIONALE" --task ID` | Save an explicit decision for the next record. |
+| `search "TEXT"` | Search local and committed conversation history. |
+| `context --task ID` | Prepare excerpts with source references for a task handoff. |
+| `explain --file PATH` | Find conversation records associated with a file. |
+| `show COMMIT` | Read a commit's conversation and referenced context. |
+
+`show` and `verify` default to `HEAD`. Add `--task ID` to preview, export or commit when you need to select a task. For capture options and supported commit workflows, see [assistant setup](docs/adapters.md) and the [commit guide](docs/controlled-commits.md).
 
 ## Coverage and privacy
 
