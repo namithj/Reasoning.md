@@ -299,3 +299,13 @@ test('reinstalling native hooks preserves an originally unset hooksPath', t => {
   ok('hooks', 'install'); ok('hooks', 'install'); ok('hooks', 'uninstall');
   assert.throws(() => git('config', '--local', '--get', 'core.hooksPath'));
 });
+
+test('native hooks tolerate equivalent absolute path spellings', t => {
+  const { repo, ok } = setup(t);
+  ok('hooks', 'install');
+  const installation = join(repo.commonState, 'native-installation.json');
+  const state = JSON.parse(readFileSync(installation, 'utf8'));
+  state.directory += '/.'; // Git and Node may render the same absolute path differently.
+  writeFileSync(installation, JSON.stringify(state));
+  ok('hooks', 'install'); ok('hooks', 'uninstall');
+});

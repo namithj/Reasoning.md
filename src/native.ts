@@ -21,7 +21,7 @@ export function installNative(repo: Repo) {
     if (scope.stdout?.startsWith('worktree\t')) throw new Error('A worktree-specific hook manager needs a manual integration; repository hooks were not changed');
     const prior = spawnSync('git', ['config', '--local', '--get', 'core.hooksPath'], { cwd: repo.root, encoding: 'utf8' });
     const original_hooks = existing?.original_hooks ?? git(repo.root, ['rev-parse', '--path-format=absolute', '--git-path', 'hooks']).trim();
-    if (existing && git(repo.root, ['rev-parse', '--path-format=absolute', '--git-path', 'hooks']).trim() !== existing.directory) throw new Error('Hook configuration changed since installation; resolve it before reinstalling');
+    if (existing && resolve(git(repo.root, ['rev-parse', '--path-format=absolute', '--git-path', 'hooks']).trim()) !== resolve(existing.directory)) throw new Error('Hook configuration changed since installation; resolve it before reinstalling');
     privateDirectory(directory);
     const cli = fileURLToPath(new URL(import.meta.url.endsWith('.ts') ? './cli.ts' : './cli.js', import.meta.url));
     const quote = (value: string) => "'" + value.replaceAll("'", "'\\''") + "'";
@@ -44,7 +44,7 @@ export function uninstallNative(repo: Repo) {
   return locked({ ...repo, stateDir: repo.commonState }, () => {
     const state = installedNative(repo); if (!state) return { installed: false };
     const actual = git(repo.root, ['rev-parse', '--path-format=absolute', '--git-path', 'hooks']).trim();
-    if (actual !== state.directory) throw new Error('Hook configuration changed; refusing to overwrite it');
+    if (resolve(actual) !== resolve(state.directory)) throw new Error('Hook configuration changed; refusing to overwrite it');
     if (existsSync(join(repo.stateDir, 'transaction.json'))) throw new Error('Recover the pending transaction before removing native hooks');
     if (state.prior_local === null) git(repo.root, ['config', '--local', '--unset', 'core.hooksPath']);
     else git(repo.root, ['config', '--local', 'core.hooksPath', state.prior_local]);
