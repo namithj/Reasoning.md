@@ -1,0 +1,56 @@
+name: Publish Reasoning.md to npm
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: npm-publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: github.repository == 'namithj/Reasoning.md'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          registry-url: https://registry.npmjs.org/
+          package-manager-cache: false
+      - name: Use npm with trusted publishing support
+        run: npm install --global npm@11.19.0 --ignore-scripts
+      - name: Check release metadata
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          node --input-type=module <<'NODE'
+          import assert from 'node:assert/strict';
+          import { readFileSync } from 'node:fs';
+          import { VERSION } from './src/schema.ts';
+          const pkg = JSON.parse(readFileSync('package.json', 'utf8'));
+          assert.equal(pkg.name, '@namithj/reasoning.md');
+          assert.ok(!pkg.private, 'Remove private from package.json before publishing');
+          assert.equal(process.env.RELEASE_TAG, `v${pkg.version}`, 'Release tag must match package.json');
+          assert.equal(VERSION, pkg.version, 'Update src/schema.ts VERSION to match package.json');
+          NODE
+      # This package has no dependencies or lockfile, so no npm ci is needed.
+      - run: npm test
+      - run: npm run build
+      - run: node dist/cli.js --help
+      - run: npm run check:package
+      - name: Publish preview
+        run: npm publish --access public --tag next --provenance --ignore-scripts
+        env:
+          # Optional first-publication fallback; leave unset for trusted publishing.
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

@@ -1,0 +1,41 @@
+{
+  "name": "@namithj/reasoning.md",
+  "version": "0.1.0-alpha.3",
+  "description": "Local, redacted development conversation records attached to Git commits.",
+  "type": "module",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "bin": {
+    "reasoning": "dist/cli.js"
+  },
+  "files": [
+    "dist/",
+    "skills/",
+    "README.md",
+    "docs/adapters.md",
+    "docs/controlled-commits.md",
+    "docs/event-format.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "test": "node --test test/*.test.mjs",
+    "prepare": "npm run build",
+    "check:package": "node scripts/check-package.mjs"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/namithj/Reasoning.md.git"
+  },
+  "homepage": "https://github.com/namithj/Reasoning.md",
+  "bugs": {
+    "url": "https://github.com/namithj/Reasoning.md/issues"
+  },
+  "publishConfig": {
+    "access": "public",
+    "tag": "next",
+    "registry": "https://registry.npmjs.org/"
+  }
+}

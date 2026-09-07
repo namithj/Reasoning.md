@@ -1,0 +1,23 @@
+name: Package Reasoning.md candidate
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+permissions:
+  contents: read
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: npm test
+      - run: mkdir release && npm pack --pack-destination release
+      - run: npm run check:package
+      - uses: actions/upload-artifact@v4
+        with:
+          name: reasoning-md-package
+          path: release/*.tgz
+          if-no-files-found: error

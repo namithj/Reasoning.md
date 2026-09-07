@@ -1,0 +1,7 @@
+* text=auto
+*.sh text eol=lf
+.ai-history export-ignore
+.github export-ignore
+test export-ignore
+
+docs/private export-ignore

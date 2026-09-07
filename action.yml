@@ -1,0 +1,39 @@
+name: Verify Reasoning.md records
+description: Check committed conversation record structure for a selected Git range.
+inputs:
+  base:
+    description: Base commit excluded from the check
+    required: true
+  head:
+    description: Last commit included in the check
+    default: HEAD
+  require-complete:
+    description: Reject partial or unavailable capture
+    default: 'false'
+  allow-overrides:
+    description: Accept explicit recorded coverage overrides in strict checks
+    default: 'false'
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-node@v4
+      with:
+        node-version: 24
+    - name: Build recorder
+      shell: bash
+      env:
+        RECORDER_ACTION_PATH: ${{ github.action_path }}
+      run: node "$RECORDER_ACTION_PATH/scripts/build.mjs"
+    - name: Verify range
+      shell: bash
+      env:
+        RECORDER_ACTION_PATH: ${{ github.action_path }}
+        RECORDER_BASE: ${{ inputs.base }}
+        RECORDER_HEAD: ${{ inputs.head }}
+        RECORDER_REQUIRE_COMPLETE: ${{ inputs.require-complete }}
+        RECORDER_ALLOW_OVERRIDES: ${{ inputs.allow-overrides }}
+      run: |
+        args=()
+        if [[ "$RECORDER_REQUIRE_COMPLETE" == "true" ]]; then args+=(--require-complete); fi
+        if [[ "$RECORDER_ALLOW_OVERRIDES" == "true" ]]; then args+=(--allow-overrides); fi
+        node "$RECORDER_ACTION_PATH/dist/cli.js" verify-range "$RECORDER_BASE..$RECORDER_HEAD" "${args[@]}"
