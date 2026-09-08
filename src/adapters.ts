@@ -1,9 +1,9 @@
 import { randomUUID } from 'node:crypto';
 import { existsSync, readFileSync, realpathSync, statSync, rmSync, readdirSync } from 'node:fs';
-import { isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { isAbsolute, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { appendEvents, journal } from './recorder.ts';
-import { atomicWrite, config, identity, locked, privateDirectory, readJSON, repository, assertPlain, environment, syncDirectory } from './storage.ts';
+import { atomicWrite, config, containsPath, identity, locked, privateDirectory, readJSON, repository, samePath, assertPlain, environment, syncDirectory } from './storage.ts';
 import type { Repo } from './storage.ts';
 import { hash, identifier, json, normalize, object, parseInput, redact } from './schema.ts';
 import type { InputEvent, EventType } from './schema.ts';
@@ -43,8 +43,8 @@ const parsed = (id: string, type: EventType, content: unknown, timestamp: unknow
 
 function associatedPath(path: unknown, repo: Repo, workspaceRoot = repo.root) {
   if (typeof path !== 'string' || !isAbsolute(path)) return false;
-  try { if (repository(path).root === repo.root) return true; } catch { /* A workspace parent need not be a Git checkout. */ }
-  try { return realpathSync(path) === realpathSync(workspaceRoot); } catch { return false; }
+  try { if (samePath(repository(path).root, repo.root)) return true; } catch { /* A workspace parent need not be a Git checkout. */ }
+  try { return samePath(path, workspaceRoot); } catch { return false; }
 }
 
 // These parsers accept declared, versioned formats only. A host upgrade is not evidence of compatibility.
@@ -192,8 +192,8 @@ export function enableAdapter(repo: Repo, hostName: string, options: { parser?: 
   const surface = options.surface ?? (host === 'codex-desktop' ? 'desktop' : host.endsWith('export') ? 'import' : host.endsWith('cli') || host.endsWith('cloud') ? 'cli' : 'extension');
   if (!['extension', 'cli', 'desktop', 'import'].includes(surface)) throw new Error('Unknown host surface');
   const configPath = surface === 'import' ? null : spec.config;
-  const configRoot = realpathSync(options.workspaceRoot ?? repo.root); const rel = relative(configRoot, repo.root);
-  if (rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)) throw new Error('Adapter workspace must contain the selected repository');
+  const configRoot = realpathSync.native(options.workspaceRoot ?? repo.root);
+  if (!containsPath(configRoot, repo.root)) throw new Error('Adapter workspace must contain the selected repository');
   return locked(repo, () => {
     config(repo); finishCapture(repo); const state = captureState(repo);
     const cli = fileURLToPath(new URL(import.meta.url.endsWith('.ts') ? './cli.ts' : './cli.js', import.meta.url));

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
@@ -14,7 +14,7 @@ const cli = fileURLToPath(new URL('../src/cli.ts', import.meta.url));
 const jsonl = rows => rows.map(row => JSON.stringify(row) + '\n').join('');
 
 function sandbox(t) {
-  const workspace = mkdtempSync(join(tmpdir(), 'reasoning-workspace-'));
+  const workspace = realpathSync.native(mkdtempSync(join(tmpdir(), 'reasoning-workspace-')));
   t.after(() => rmSync(workspace, { recursive: true, force: true }));
   return workspace;
 }

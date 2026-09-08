@@ -1,8 +1,8 @@
 import { execFileSync } from 'node:child_process';
 import { closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync,
-  realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+  realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { hostname, platform, release } from 'node:os';
-import { isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { hash, json } from './schema.ts';
 
@@ -10,6 +10,23 @@ export type Repo = { root: string; gitDir: string; commonDir: string; stateDir: 
 export type Config = { schema_version: 1; repository_id: string; publication: 'private' | 'public'; mode: 'warn' | 'strict'; summarization: false };
 export type ProjectContext = { repo: Repo; workspaceRoot: string; discovery: 'ancestor' | 'descendant' | 'explicit' };
 export type WorkspaceBinding = { schema_version: 1; workspace_root: string; repository_root: string; discovery: ProjectContext['discovery'] };
+
+export const canonicalPath = (path: string) => realpathSync.native(path);
+
+export function samePath(left: string, right: string) {
+  const a = statSync(left, { bigint: true }); const b = statSync(right, { bigint: true });
+  return a.dev === b.dev && a.ino === b.ino && (a.ino !== 0n || canonicalPath(left) === canonicalPath(right));
+}
+
+export function containsPath(parent: string, child: string) {
+  let current = child;
+  while (true) {
+    if (samePath(parent, current)) return true;
+    const next = dirname(current);
+    if (next === current) return false;
+    current = next;
+  }
+}
 
 export function git(cwd: string, args: string[]): string {
   return gitBytes(cwd, args).toString('utf8');
@@ -23,9 +40,9 @@ export function gitBytes(cwd: string, args: string[]): Buffer {
 }
 
 export function repository(cwd = process.cwd()): Repo {
-  const root = realpathSync(git(cwd, ['rev-parse', '--show-toplevel']).trim());
-  const gitDir = realpathSync(git(cwd, ['rev-parse', '--absolute-git-dir']).trim());
-  const commonDir = realpathSync(git(cwd, ['rev-parse', '--path-format=absolute', '--git-common-dir']).trim());
+  const root = canonicalPath(git(cwd, ['rev-parse', '--show-toplevel']).trim());
+  const gitDir = canonicalPath(git(cwd, ['rev-parse', '--absolute-git-dir']).trim());
+  const commonDir = canonicalPath(git(cwd, ['rev-parse', '--path-format=absolute', '--git-common-dir']).trim());
   // Keep the original storage directory so the Reasoning.md rename preserves existing journals and hooks.
   const stateDir = join(gitDir, 'reasoning-recorder');
   // Unusual --separate-git-dir layouts must not put the journal in trackable files.
@@ -46,22 +63,22 @@ export function workspaceBinding(repo: Repo): WorkspaceBinding | null {
   const value = readJSON(path) as WorkspaceBinding;
   if (value.schema_version !== 1 || !isAbsolute(value.workspace_root) || !isAbsolute(value.repository_root)
     || !['ancestor', 'descendant', 'explicit'].includes(value.discovery)) throw new Error('Invalid workspace binding');
-  if (realpathSync(value.repository_root) !== repo.root) throw new Error('Workspace binding points to a different repository');
-  const root = realpathSync(value.workspace_root); const rel = relative(root, repo.root);
-  if (rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)) throw new Error('Workspace binding does not contain the repository');
+  if (!samePath(value.repository_root, repo.root)) throw new Error('Workspace binding points to a different repository');
+  const root = canonicalPath(value.workspace_root);
+  if (!containsPath(root, repo.root)) throw new Error('Workspace binding does not contain the repository');
   return { ...value, workspace_root: root, repository_root: repo.root };
 }
 
 export function bindWorkspace(repo: Repo, workspaceRoot: string, discovery: ProjectContext['discovery']): WorkspaceBinding {
-  const root = realpathSync(workspaceRoot); const rel = relative(root, repo.root);
-  if (rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)) throw new Error('Workspace root must contain the selected repository');
+  const root = canonicalPath(workspaceRoot);
+  if (!containsPath(root, repo.root)) throw new Error('Workspace root must contain the selected repository');
   const value: WorkspaceBinding = { schema_version: 1, workspace_root: root, repository_root: repo.root, discovery };
   privateDirectory(repo.stateDir); atomicWrite(join(repo.stateDir, 'workspace.json'), json(value));
   return value;
 }
 
 export function discoverProject(cwd = process.cwd(), selected?: string): ProjectContext {
-  const invocation = realpathSync(cwd);
+  const invocation = canonicalPath(cwd);
   if (selected) {
     const repo = repository(resolve(invocation, selected)); const saved = workspaceBinding(repo);
     return { repo, workspaceRoot: saved?.workspace_root ?? invocation, discovery: 'explicit' };
@@ -75,7 +92,7 @@ export function discoverProject(cwd = process.cwd(), selected?: string): Project
 
   let level = [invocation]; let inspected = 0;
   while (level.length) {
-    const next: string[] = []; const candidates = new Map<string, Repo>();
+    const next: string[] = []; const candidates = new Map<string, { repo: Repo; name: string }>();
     for (const parent of level) {
       let entries;
       try { entries = readdirSync(parent, { withFileTypes: true }); } catch { continue; }
@@ -86,13 +103,13 @@ export function discoverProject(cwd = process.cwd(), selected?: string): Project
         let hasMarker = false;
         try { const stat = lstatSync(marker); hasMarker = !stat.isSymbolicLink() && (stat.isDirectory() || stat.isFile()); } catch { /* Not a worktree root. */ }
         if (hasMarker) {
-          try { const repo = repository(child); candidates.set(repo.root, repo); } catch { /* Ignore invalid Git markers. */ }
+          try { const repo = repository(child); candidates.set(repo.root, { repo, name: relative(invocation, child) || '.' }); } catch { /* Ignore invalid Git markers. */ }
         } else next.push(child);
       }
     }
-    if (candidates.size === 1) return { repo: [...candidates.values()][0], workspaceRoot: invocation, discovery: 'descendant' };
+    if (candidates.size === 1) return { repo: [...candidates.values()][0].repo, workspaceRoot: invocation, discovery: 'descendant' };
     if (candidates.size > 1) {
-      const names = [...candidates.keys()].map(path => relative(invocation, path) || '.').sort().join(', ');
+      const names = [...candidates.values()].map(candidate => candidate.name).sort().join(', ');
       throw new Error(`Multiple Git checkouts found below this workspace: ${names}. Use --repo PATH`);
     }
     level = next;
