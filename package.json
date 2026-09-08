@@ -1,6 +1,6 @@
 {
   "name": "@namithj/reasoning.md",
-  "version": "0.1.0-alpha.3",
+  "version": "0.1.0-alpha.5",
   "description": "Local, redacted development conversation records attached to Git commits.",
   "type": "module",
   "engines": {

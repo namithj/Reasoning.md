@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 
-export const VERSION = '0.1.0-alpha.3';
+export const VERSION = '0.1.0-alpha.5';
 export const INPUT_LIMIT = 5 * 1024 * 1024;
 export const CONTENT_LIMIT = 16 * 1024;
 export const TYPES = ['user_message', 'assistant_message', 'tool_call', 'tool_result',

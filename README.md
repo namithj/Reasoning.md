@@ -6,7 +6,7 @@ The npm package is `@namithj/reasoning.md`; the command is `reasoning`.
 
 Save accessible development conversations alongside the Git commits they explain. Records contain readable text, structured events, source references and a fingerprint of the staged code. No cloud service, model call or external dependency is required.
 
-**0.1.0-alpha.3 · MIT · experimental.** Includes host capture, durable reconciliation, controlled commits, opt-in native Git hooks, decision capture, cited task handoffs and a reusable CI verifier. Real extension-panel and Source Control compatibility remain unverified. Copilot VS Code imports and reconciles v1 session-event transcripts, including full exposed replies and tool activity. See [adapter scope and limitations](docs/adapters.md) and the [implementation and acceptance status](docs/implementation-status.md).
+**0.1.0-alpha.5 · MIT · experimental.** Includes host capture, durable reconciliation, controlled commits, opt-in native Git hooks, decision capture, cited task handoffs and a reusable CI verifier. Real extension-panel and Source Control compatibility remain unverified. Copilot VS Code imports and reconciles v1 session-event transcripts, including full exposed replies and tool activity. See [adapter scope and limitations](docs/adapters.md) and the [implementation and acceptance status](docs/implementation-status.md).
 
 ## Install
 
@@ -34,7 +34,7 @@ npm install --global .
 reasoning --version
 ```
 
-If you already have a compiled package, you can install it directly with `npm install --global ./namithj-reasoning.md-0.1.0-alpha.3.tgz`.
+If you already have a compiled package, you can install it directly with `npm install --global ./namithj-reasoning.md-0.1.0-alpha.5.tgz`.
 
 ## How to Use
 
