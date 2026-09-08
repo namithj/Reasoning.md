@@ -3,13 +3,13 @@ import { createReadStream, existsSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { parseArgs } from 'node:util';
 import { exportSnapshot, ingest, status } from './recorder.ts';
-import { config, initialize, repository } from './storage.ts';
+import { bindWorkspace, config, discoverProject, initialize, repository } from './storage.ts';
 import { installSkill, setPolicy, verifyRange } from './team.ts';
 import { installNative, uninstallNative, nativeHook } from './native.ts';
 import { ADAPTERS, capture, captureState, enableAdapter, reconcile, captureCheck } from './adapters.ts';
-import { startTask, bindTask, tasks, decision, search, context, explain } from './history.ts';
-import { commit, commitPreview, recover, runHook, show, verify } from './commits.ts';
-import { HOSTS, probe } from './probe.ts';
+import { startTask, resumeTask, bindTask, tasks, listTasks, decision, search, context, explain } from './history.ts';
+import { commit, amendmentBase, commitPreview, recover, runHook, show, verify } from './commits.ts';
+import { HOSTS, probe, health } from './probe.ts';
 import { INPUT_LIMIT, VERSION } from './schema.ts';
 import { formatOutput, formatError } from './output.ts';
 import type { OutputFormat } from './output.ts';
@@ -23,20 +23,20 @@ Get started in your Git project:
   reasoning adapter enable HOST          Connect your assistant (claude-code or codex)
   reasoning doctor                       Inspect setup, capture gaps and next steps
 
-Initialization does not enable capture. Automatic assistant setup is unavailable on Windows;
-use a supported transcript import there. Run reasoning --version to check your installation.
+Initialization does not enable capture. Windows setup supports claude-code and copilot-cli;
+use supported transcript imports for other Windows hosts. Run reasoning --version to check your installation.
 
 Commands:
-  reasoning init --publication private|public
+  reasoning init --publication private|public [--repo PATH]
   reasoning import --input events.jsonl|- 
   reasoning status
-  reasoning preview --staged [--task task-id]
+  reasoning preview --staged [--task task-id] [--amend]
   reasoning export --staged [--task task-id]
   reasoning probe claude-code|codex|copilot-vscode [--input hook.json|-] [--extension-dir directory]
   reasoning doctor [--extension-dir directory]
-  reasoning commit -m "message" [--task task-id] [--no-assistant-activity] [--allow-partial "reason"]
+  reasoning commit -m "message" [--task task-id] [--no-assistant-activity] [--allow-partial "reason"] [--amend]
   reasoning recover
-  reasoning task start "objective" | task list | task bind TOOL SESSION --task ID
+  reasoning task start "objective" | task resume ID | task list | task bind TOOL SESSION --task ID
   reasoning adapter enable HOST [--parser VERSION] [--surface extension|cli|desktop|import]
   reasoning adapter list | adapter check HOST --session ID --prompt TEXT --reply TEXT
   reasoning capture HOST --input FILE|- [--delivery-id ID]
@@ -58,7 +58,7 @@ Output:
   Add --format text or --format json to choose explicitly.
   Text reports (show, preview, context) use {"text": "..."} with --format json.
 
-Requires Node.js 24+ and Git. Run repository commands from the target worktree.
+Requires Node.js 24+ and Git. A sole nested worktree is discovered automatically; use --repo PATH when a workspace contains several.
 Import accepts normalized JSONL v1 or a declared host transcript with --host HOST --session ID.
 Export creates an untracked snapshot; it never stages, commits or consumes events.
 Host capture and native Git hooks are opt-in; real IDE compatibility remains unverified.
@@ -82,21 +82,21 @@ async function readInput(path: string): Promise<string> {
 async function main() {
   if (process.argv[2] === 'native-hook') {
     const [hook, ...args] = process.argv.slice(3);
-    nativeHook(repository(), hook, args, hook === 'reference-transaction' ? await readInput('-') : undefined); return;
+    nativeHook(repository(), hook, args, ['reference-transaction', 'post-rewrite'].includes(hook) ? await readInput('-') : undefined); return;
   }
   if (process.argv[2] === 'internal-hook') {
     const [hook, ...args] = process.argv.slice(3);
-    runHook(repository(), hook, args, hook === 'reference-transaction' ? await readInput('-') : undefined);
+    runHook(repository(), hook, args, ['reference-transaction', 'post-rewrite'].includes(hook) ? await readInput('-') : undefined);
     return;
   }
   const { values, positionals } = parseArgs({ allowPositionals: true, options: {
-    'allow-partial': { type: 'string' }, 'require-complete': { type: 'boolean' }, 'allow-overrides': { type: 'boolean' }, mode: { type: 'string' }, host: { type: 'string' },
+    amend: { type: 'boolean' }, 'allow-partial': { type: 'string' }, 'require-complete': { type: 'boolean' }, 'allow-overrides': { type: 'boolean' }, mode: { type: 'string' }, host: { type: 'string' },
     parser: { type: 'string' }, surface: { type: 'string' }, 'host-version': { type: 'string' }, 'extension-version': { type: 'string' },
     session: { type: 'string' }, prompt: { type: 'string' }, reply: { type: 'string' }, 'delivery-id': { type: 'string' },
     file: { type: 'string' }, limit: { type: 'string' },
     message: { type: 'string', short: 'm' }, 'no-assistant-activity': { type: 'boolean' },
     publication: { type: 'string' }, input: { type: 'string' }, task: { type: 'string' },
-    staged: { type: 'boolean' }, 'extension-dir': { type: 'string' },
+    staged: { type: 'boolean' }, 'extension-dir': { type: 'string' }, repo: { type: 'string' },
     format: { type: 'string' },
     help: { type: 'boolean', short: 'h' }, version: { type: 'boolean', short: 'v' },
   } });
@@ -110,31 +110,42 @@ async function main() {
     skill: ['host'], policy: ['mode'], 'verify-range': ['require-complete', 'allow-overrides'], hooks: [],
     adapter: ['parser', 'surface', 'host-version', 'extension-version', 'session', 'prompt', 'reply'],
     capture: ['input', 'delivery-id'], reconcile: [], task: ['task'], decision: ['task'], search: [], context: ['task', 'limit'], explain: ['file'],
-    commit: ['message', 'task', 'no-assistant-activity', 'allow-partial'], recover: [], show: [], verify: [],
-    init: ['publication'], import: ['input', 'host', 'session'], status: [], preview: ['staged', 'task'],
+    commit: ['amend', 'message', 'task', 'no-assistant-activity', 'allow-partial'], recover: [], show: [], verify: [],
+    init: ['publication'], import: ['input', 'host', 'session'], status: [], preview: ['staged', 'task', 'amend'],
     export: ['staged', 'task'], probe: ['input', 'extension-dir'], doctor: ['extension-dir'],
   };
   if (!Object.hasOwn(allowed, command)) throw new Error('Unknown command; run reasoning --help');
   const counts = ['show', 'verify'].includes(command) ? [1, 2] : ['adapter', 'task'].includes(command) ? [2, 3, 4] : ['skill', 'verify-range', 'hooks', 'capture', 'probe', 'decision', 'search'].includes(command) ? [2] : [1];
   if (!counts.includes(positionals.length)) throw new Error('Unexpected or missing command arguments; run reasoning --help');
-  if (Object.keys(values).some(key => key !== 'format' && !allowed[command].includes(key))) throw new Error('Option is not supported by this command');
+  if (Object.keys(values).some(key => !['format', 'repo'].includes(key) && !allowed[command].includes(key))) throw new Error('Option is not supported by this command');
   if (command === 'probe') {
     let payload: unknown;
     if (values.input) {
       const input = await readInput(values.input);
       try { payload = JSON.parse(input); } catch { throw new Error('Invalid hook JSON'); }
     }
-    output(probe(host, process.cwd(), payload, values['extension-dir'])); return;
+    const cwd = values.repo ? discoverProject(process.cwd(), values.repo).repo.root : process.cwd();
+    output(probe(host, cwd, payload, values['extension-dir'])); return;
   }
-  const repo = repository();
+  const project = discoverProject(process.cwd(), values.repo); const repo = project.repo;
   if (command === 'init') {
-    output(initialize(repo, values.publication ?? '')); return;
+    const initialized = initialize(repo, values.publication ?? '');
+    const workspace = bindWorkspace(repo, project.workspaceRoot, project.discovery);
+    const installed = captureState(repo).installations; const reconfigured_adapters: string[] = [];
+    for (const [name, setup] of Object.entries(installed)) {
+      enableAdapter(repo, name, { parser: setup.parser, surface: setup.surface, hostVersion: setup.host_version ?? undefined,
+        extensionVersion: setup.extension_version ?? undefined, workspaceRoot: workspace.workspace_root });
+      reconfigured_adapters.push(name);
+    }
+    output({ ...initialized, workspace, reconfigured_adapters }); return;
   }
   if (command === 'doctor') {
     const initialized = existsSync(join(repo.root, '.ai-history', 'config.json'));
     output({ initialized, recorder_executable: process.argv[1], node_executable: process.execPath,
       local_state: repo.stateDir, recorder: initialized ? status(repo) : null,
+      health: initialized ? health(repo) : null,
       capture: initialized ? captureState(repo) : null, tasks: initialized ? tasks(repo) : null,
+      workspace: { workspace_root: project.workspaceRoot, repository_root: repo.root, discovery: project.discovery },
       hosts: Object.keys(HOSTS).map(name => probe(name, repo.root, undefined, values['extension-dir'])) }); return;
   }
   if (command === 'verify-range') { const result = verifyRange(repo, host, values['require-complete'], values['allow-overrides']); output(result); if (!result.verified) process.exitCode = 1; return; }
@@ -146,6 +157,7 @@ async function main() {
     const { records, ...result } = verify(repo, host);
     output({ ...result, verified: true, referenced_records: records.size - 1 }); return;
   }
+  if (command === 'task' && host === 'list' && positionals.length === 2) { output(listTasks(repo)); return; }
   config(repo);
   if (command === 'policy') { if (!values.mode) throw new Error('Policy requires --mode'); output(setPolicy(repo, values.mode)); return; }
   if (command === 'skill') { if (host !== 'install' || !values.host) throw new Error('Use skill install --host HOST'); output(installSkill(repo, values.host)); return; }
@@ -159,8 +171,8 @@ async function main() {
     const target = positionals[2];
     if (host === 'list' && positionals.length === 2) { output({ available: ADAPTERS, state: captureState(repo) }); return; }
     if (!target || positionals.length !== 3) throw new Error('Use adapter enable HOST or adapter check HOST');
-    if (host === 'enable') { output(enableAdapter(repo, target, { parser: values.parser, surface: values.surface, hostVersion: values['host-version'], extensionVersion: values['extension-version'] })); return; }
-    if (host === 'check') { if (!values.session || !values.prompt || !values.reply) throw new Error('Capture check requires --session, --prompt and --reply'); output(captureCheck(repo, target, values.session, values.prompt, values.reply)); return; }
+    if (host === 'enable') { output(enableAdapter(repo, target, { parser: values.parser, surface: values.surface, hostVersion: values['host-version'], extensionVersion: values['extension-version'], workspaceRoot: project.workspaceRoot })); return; }
+    if (host === 'check') { if (!values.session || !values.prompt || !values.reply) throw new Error('Capture check requires --session, --prompt and --reply'); const result = captureCheck(repo, target, values.session, values.prompt, values.reply); output(result); if (!result.fixture_or_session_content_check) process.exitCode = 1; return; }
     throw new Error('Unknown adapter operation');
   }
   if (command === 'capture') {
@@ -174,30 +186,30 @@ async function main() {
   }
   if (command === 'reconcile') { output(reconcile(repo)); return; }
   if (command === 'task') {
-    if (host === 'list' && positionals.length === 2) { output(tasks(repo)); return; }
+    if (host === 'resume' && positionals.length === 3) { output(resumeTask(repo, positionals[2])); return; }
     if (host === 'start' && positionals.length === 3) { output(startTask(repo, positionals[2])); return; }
-    if (host === 'bind' && positionals.length === 4 && values.task) { output(bindTask(repo, positionals[2], positionals[3], values.task)); return; }
-    throw new Error('Use task start TITLE, task list, or task bind TOOL SESSION --task ID');
+    if (host === 'bind' && positionals.length === 4 && values.task) { output(bindTask(repo, ADAPTERS[positionals[2] as keyof typeof ADAPTERS]?.tool ?? positionals[2], positionals[3], values.task)); return; }
+    throw new Error('Use task start TITLE, task resume ID, task list, or task bind TOOL SESSION --task ID');
   }
   if (command === 'decision') { output(decision(repo, host, values.task)); return; }
   if (command === 'commit') {
     if (!values.message) throw new Error('Commit requires -m message');
     reconcile(repo);
-    output(commit(repo, values.message, values.task, values['no-assistant-activity'], values['allow-partial'])); return;
+    output(commit(repo, values.message, values.task, values['no-assistant-activity'], values['allow-partial'], values.amend)); return;
   }
   if (command === 'recover') { output(recover(repo)); return; }
   if (command === 'import') {
     if (!values.input) throw new Error('Import requires --input events.jsonl or --input -');
     if (values.host) {
       if (!values.session || values.input === '-') throw new Error('Host transcript import requires --session and a file path');
-      if (!captureState(repo).installations[values.host]) enableAdapter(repo, values.host, { surface: 'import' });
+      if (!captureState(repo).installations[values.host]) enableAdapter(repo, values.host, { surface: 'import', workspaceRoot: project.workspaceRoot });
       output(capture(repo, values.host, { hook_event_name: 'Reconcile', session_id: values.session, cwd: repo.root, transcript_path: resolve(values.input) }, 'explicit-import'));
     } else output(ingest(repo, await readInput(values.input)));
   } else if (command === 'status') {
     output(status(repo));
   } else {
     if (!values.staged) throw new Error('Preview and export require --staged; only the actual index is represented');
-    if (command === 'preview') output(commitPreview(repo, values.task).reasoning);
+    if (command === 'preview') output(commitPreview(repo, values.task, false, values.amend ? amendmentBase(repo) : undefined).reasoning);
     else output(exportSnapshot(repo, values.task));
   }
 }

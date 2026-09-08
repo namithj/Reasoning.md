@@ -96,20 +96,20 @@ export function status(repo: Repo) {
   };
 }
 
-export function staged(repo: Repo) {
+export function staged(repo: Repo, base?: string) {
   const paths = [':(top)**', ':(top,exclude).ai-history/records/**'];
-  const diff = gitBytes(repo.root, ['diff', '--cached', '--raw', '-z', '--no-abbrev', '--no-renames', '--no-ext-diff', '--', ...paths]);
+  const diff = gitBytes(repo.root, ['diff', '--cached', '--raw', '-z', '--no-abbrev', '--no-renames', '--no-ext-diff', ...(base ? [base] : []), '--', ...paths]);
   if (git(repo.root, ['ls-files', '--unmerged', '-z']).length) throw new Error('Resolve unmerged index entries before preparing a record');
-  const changed = git(repo.root, ['diff', '--cached', '--name-only', '-z', '--no-renames', '--no-ext-diff', '--', ...paths]).split('\0').filter(Boolean);
+  const changed = git(repo.root, ['diff', '--cached', '--name-only', '-z', '--no-renames', '--no-ext-diff', ...(base ? [base] : []), '--', ...paths]).split('\0').filter(Boolean);
   return { paths: changed, fingerprint: hash(diff) };
 }
 
-export function snapshot(repo: Repo, task?: string, options: { commit?: boolean; excludeIds?: Set<string>; references?: string[]; noActivity?: boolean } = {}) {
+export function snapshot(repo: Repo, task?: string, options: { commit?: boolean; excludeIds?: Set<string>; references?: string[]; noActivity?: boolean; base?: string } = {}) {
   const policy = config(repo);
   const all = journal(repo);
   if (!task && new Set(all.map(e => e.task_id)).size > 1) throw new Error('Multiple tasks are present; choose --task explicitly');
   let events = task ? all.filter(e => e.task_id === task) : all;
-  if (task && !events.length) throw new Error('No imported events match this task');
+  if (task && !events.length && !options.references?.length) throw new Error('No imported events match this task');
   const selectedTask = task ?? events[0]?.task_id ?? null;
   events = events.filter(event => !options.excludeIds?.has(event.event_id));
   if (options.noActivity && events.length) throw new Error('Cannot attest no assistant activity while selected events are pending');
@@ -125,10 +125,10 @@ export function snapshot(repo: Repo, task?: string, options: { commit?: boolean;
   });
   const sessions = [...new Set(events.map(sourceKey))];
   events.sort((a, b) => sessions.indexOf(sourceKey(a)) - sessions.indexOf(sourceKey(b)) || a.sequence - b.sequence);
-  const scope = staged(repo);
-  const omissions = ['Native conversation capture is unverified. Only explicitly imported events are present.',
+  const scope = staged(repo, options.base);
+  const omissions = ['Host-panel completeness is unverified. Only observable captured and imported events are present.',
     'Events are ordered within each session; no total chronological order across sessions is claimed.',
-    options.commit ? 'Only imported events at this frozen boundary are included. Native capture remains unverified.' : 'This is a snapshot, not a finalized commit record. Export does not consume journal events.'];
+    options.commit ? 'Only captured and imported events at this frozen boundary are included. Host-panel completeness remains unverified.' : 'This is a snapshot, not a finalized commit record. Export does not consume journal events.'];
   const sourceSessions = sessions.map(key => {
     const selected = events.filter(e => sourceKey(e) === key);
     const sequences = selected.map(e => e.sequence);
@@ -173,6 +173,7 @@ export function snapshot(repo: Repo, task?: string, options: { commit?: boolean;
     affected_events: events.filter(e => e.redaction.rules.length).length,
     omitted_events: events.filter(e => e.redaction.omissions.length).length };
   const manifest = {
+    code_base: options.base, preserved_records: {} as Record<string, string>,
     queued_capture_deliveries: queued, capture_sources: captureSources,
     capture_override: null as string | null,
     schema_version: 1, record_id: recordId, repository_id: policy.repository_id,
@@ -199,7 +200,7 @@ export function writeRecord(repo: Repo, record: RecordData) {
     atomicWrite(join(temp, 'reasoning.txt'), record.reasoning);
     atomicWrite(join(temp, 'events.jsonl'), record.eventData);
     atomicWrite(join(temp, 'manifest.json'), json(record.manifest));
-    if (staged(repo).fingerprint !== record.manifest.staged_code_fingerprint) throw new Error('Staged changes changed during export; retry');
+    if (staged(repo, record.manifest.code_base).fingerprint !== record.manifest.staged_code_fingerprint) throw new Error('Staged changes changed during export; retry');
     renameSync(temp, destination); syncDirectory(parent);
   } finally { rmSync(temp, { recursive: true, force: true }); }
   return destination;

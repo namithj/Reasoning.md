@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
-import { existsSync, readFileSync, statSync, rmSync, readdirSync } from 'node:fs';
-import { isAbsolute, join, resolve } from 'node:path';
+import { existsSync, readFileSync, realpathSync, statSync, rmSync, readdirSync } from 'node:fs';
+import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { appendEvents, journal } from './recorder.ts';
 import { atomicWrite, config, identity, locked, privateDirectory, readJSON, repository, assertPlain, environment, syncDirectory } from './storage.ts';
@@ -12,15 +12,15 @@ import { bindingKey, tasks } from './history.ts';
 export const ADAPTERS = {
   'claude-code': { tool: 'claude-code', parser: 'claude-jsonl-v1', config: '.claude/settings.local.json' },
   codex: { tool: 'codex', parser: 'codex-rollout-v1', config: '.codex/hooks.json' },
-  'copilot-vscode': { tool: 'copilot', parser: 'none', config: '.github/hooks/reasoning-vscode.json' },
+  'copilot-vscode': { tool: 'copilot', parser: 'copilot-events-v1', config: '.github/hooks/reasoning-vscode.json' },
   'copilot-cli': { tool: 'copilot', parser: 'copilot-events-v1', config: '.github/hooks/reasoning-cli.json' },
   'copilot-cloud': { tool: 'copilot', parser: 'copilot-events-v1', config: '.github/hooks/reasoning-cloud.json' },
   'codex-desktop': { tool: 'codex', parser: 'codex-rollout-v1', config: null },
   'chatgpt-export': { tool: 'chatgpt', parser: 'chatgpt-export-v1', config: null },
 } as const;
 export type Adapter = keyof typeof ADAPTERS;
-type Parsed = { id: string; type: EventType; content: string; timestamp: string | null; tool_call_id: string | null };
-type Installation = { parser: string; surface: InputEvent['source']['surface']; host_version: string | null; extension_version: string | null; config_path: string | null; command: string | null };
+type Parsed = { model?: string | null; id: string; type: EventType; content: string; timestamp: string | null; tool_call_id: string | null };
+type Installation = { hook_entry?: Record<string, unknown>; node_executable?: string; recorder_executable?: string; parser: string; surface: InputEvent['source']['surface']; host_version: string | null; extension_version: string | null; config_root?: string | null; workspace_root?: string; config_path: string | null; command: string | null };
 type CaptureState = { schema_version: 1; installations: Record<string, Installation>; sessions: Record<string, {
   task: string; aliases: Record<string, string>; provisional: string[]; last_capture: string; transcript: string | null;
   host: string; session: string; gaps: string[]; observed: string[]; deliveries: number;
@@ -41,8 +41,14 @@ const iso = (value: unknown): string | null => typeof value === 'string' && Numb
 const text = (value: unknown) => typeof value === 'string' ? value : JSON.stringify(value ?? null);
 const parsed = (id: string, type: EventType, content: unknown, timestamp: unknown, call: string | null = null): Parsed => ({ id, type, content: text(content), timestamp: iso(timestamp), tool_call_id: call });
 
+function associatedPath(path: unknown, repo: Repo, workspaceRoot = repo.root) {
+  if (typeof path !== 'string' || !isAbsolute(path)) return false;
+  try { if (repository(path).root === repo.root) return true; } catch { /* A workspace parent need not be a Git checkout. */ }
+  try { return realpathSync(path) === realpathSync(workspaceRoot); } catch { return false; }
+}
+
 // These parsers accept declared, versioned formats only. A host upgrade is not evidence of compatibility.
-export function parseTranscript(host: Adapter, parser: string, data: string, session: string, cwd: string): Parsed[] {
+export function parseTranscript(host: Adapter, parser: string, data: string, session: string, cwd: string, workspaceRoot = cwd): Parsed[] {
   if (Buffer.byteLength(data) > 32 * 1024 * 1024) throw new Error('Transcript exceeds the 32 MiB parser limit');
   if (parser === 'none') throw new Error('No verified transcript parser is available for this host');
   if (parser !== ADAPTERS[host].parser) throw new Error('Unsupported parser version for this host');
@@ -68,18 +74,19 @@ export function parseTranscript(host: Adapter, parser: string, data: string, ses
       return [parsed(identifier(message.id, 'export message ID'), role === 'user' ? 'user_message' : role === 'tool' ? 'tool_result' : 'assistant_message', message.content.parts.join('\n'), message.create_time == null ? null : message.create_time * 1000)];
     });
   }
-  // Compare canonical worktree roots on both sides (path aliases vary by OS).
-  cwd = repository(cwd).root;
+  // Compare the selected worktree and its explicitly bound host workspace.
+  const repo = repository(cwd);
   if (data && !data.endsWith('\n')) throw new Error('Transcript has an incomplete final line; retry reconciliation after the source flushes');
-  const output: Parsed[] = []; let associated = false;
+  const output: Parsed[] = []; const calls = new Set<string>(); let associated = false; let model: string | null = null;
   for (const [index, line] of data.split('\n').entries()) {
     if (!line.trim()) continue;
     let row: any;
     try { row = JSON.parse(line); } catch { throw new Error(`Invalid transcript JSON at line ${index + 1}`); }
     if (!row || typeof row !== 'object') throw new Error('Invalid transcript row');
+    const firstEvent = output.length;
     if (parser === 'claude-jsonl-v1') {
       if (row.sessionId !== undefined && row.sessionId !== session) throw new Error('Transcript session does not match the hook');
-      if (row.cwd && repository(row.cwd).root !== cwd) throw new Error('Transcript belongs to a different worktree');
+      if (row.cwd && !associatedPath(row.cwd, repo, workspaceRoot)) throw new Error('Transcript belongs to a different worktree');
       if (row.sessionId === session && row.cwd) associated = true;
       if (['user', 'assistant'].includes(row.type)) {
         const id = identifier(row.uuid, 'transcript UUID');
@@ -100,16 +107,27 @@ export function parseTranscript(host: Adapter, parser: string, data: string, ses
     } else if (parser === 'copilot-events-v1') {
       const item = row.data; const id = identifier(row.id, 'Copilot event ID');
       if (row.type === 'session.start') {
-        if (item?.version !== 1 || item.sessionId !== session || !item.context?.cwd || repository(item.context.cwd).root !== cwd) throw new Error('Unsupported Copilot version or repository/session mismatch');
+        if (item?.version !== 1 || item.sessionId !== session) throw new Error('Unsupported Copilot version or repository/session mismatch');
+        if (item.context?.cwd ? !associatedPath(item.context.cwd, repo, workspaceRoot) : (host !== 'copilot-vscode' || item.producer !== 'copilot-agent' || typeof item.vscodeVersion !== 'string')) throw new Error('Copilot transcript repository mismatch or missing context');
+        if (!item.context?.cwd) output.push(parsed(`${id}:association`, 'capture_gap', 'VS Code transcript omits working directory; repository association comes from the supplied hook/import, not source metadata.', row.timestamp));
         associated = true;
       } else if (row.type === 'session.context_changed') {
-        if (!item?.cwd || repository(item.cwd).root !== cwd) throw new Error('Copilot session changed worktrees; split the source before importing');
+        if (!item?.cwd || !associatedPath(item.cwd, repo, workspaceRoot)) throw new Error('Copilot session changed worktrees; split the source before importing');
       } else if (row.ephemeral || row.type.startsWith('assistant.reasoning') || row.type === 'assistant.message_delta' || row.type === 'assistant.message_start') continue;
       else if (['user.message', 'assistant.message'].includes(row.type)) {
         if (typeof item?.content !== 'string') throw new Error('Unsupported Copilot message content');
         output.push(parsed(id, row.type === 'user.message' ? 'user_message' : 'assistant_message', item.content, row.timestamp));
+        // Replayed VS Code history can expose requests without execution entries.
+        for (const call of item.toolRequests ?? []) {
+          const callId = identifier(call.toolCallId, 'Copilot tool call ID');
+          let input = call.arguments;
+          if (typeof input === 'string') { try { input = JSON.parse(input); } catch { /* Preserve exposed text. */ } }
+          if (!calls.has(callId)) { calls.add(callId); output.push(parsed(`call:${callId}`, 'tool_call', { name: call.name, input }, row.timestamp, callId)); }
+        }
         if (item.attachments?.length) output.push(parsed(`${id}:attachments`, 'capture_gap', 'Copilot attachments omitted; only visible text is captured.', row.timestamp));
-      } else if (row.type === 'tool.execution_start') output.push(parsed(`call:${item.toolCallId}`, 'tool_call', { name: item.toolName, input: item.arguments }, row.timestamp, item.toolCallId));
+      } else if (row.type === 'tool.execution_start') {
+        if (!calls.has(item.toolCallId)) { calls.add(item.toolCallId); output.push(parsed(`call:${item.toolCallId}`, 'tool_call', { name: item.toolName, input: item.arguments }, row.timestamp, item.toolCallId)); }
+      }
       else if (row.type === 'tool.execution_complete') output.push(parsed(`result:${item.toolCallId}`, 'tool_result', item.result?.detailedContent ?? item.result?.content ?? item.error?.message ?? 'Tool completed without exposed text.', row.timestamp, item.toolCallId));
       else if (row.type === 'session.compaction_complete') output.push(parsed(id, 'compaction_boundary', 'Copilot reported compaction; generated summaries are not original conversation.', row.timestamp));
       else if (!['session.resume', 'session.idle', 'session.shutdown', 'session.info', 'session.warning', 'session.error', 'session.model_change', 'session.mode_changed', 'session.compaction_start', 'session.context_cleared', 'assistant.turn_start', 'assistant.turn_end', 'assistant.usage', 'tool.execution_progress', 'tool.execution_partial_result'].includes(row.type)) {
@@ -117,8 +135,10 @@ export function parseTranscript(host: Adapter, parser: string, data: string, ses
       }
     } else {
       if (row.type === 'session_meta') {
-        if (row.payload?.id !== session || !row.payload?.cwd || repository(row.payload.cwd).root !== cwd) throw new Error('Codex transcript repository/session mismatch');
+        if (row.payload?.id !== session || !row.payload?.cwd || !associatedPath(row.payload.cwd, repo, workspaceRoot)) throw new Error('Codex transcript repository/session mismatch');
         associated = true;
+      } else if (row.type === 'turn_context') {
+        model = typeof row.payload?.model === 'string' ? row.payload.model : null;
       } else if (row.type === 'response_item') {
         const item = row.payload;
         const id = `row:${index}`;
@@ -134,7 +154,12 @@ export function parseTranscript(host: Adapter, parser: string, data: string, ses
         else if (['function_call_output', 'custom_tool_call_output'].includes(item?.type)) output.push(parsed(`result:${item.call_id}`, 'tool_result', item.output, row.timestamp, item.call_id));
         else throw new Error('Unsupported Codex response item');
       } else if (row.type === 'compacted') output.push(parsed(`compact:${index}`, 'compaction_boundary', 'Source reported compaction. Its generated summary is not an original exchange.', row.timestamp));
-      else if (!['event_msg', 'turn_context'].includes(row.type)) throw new Error('Unsupported Codex rollout row type');
+      else if (!['event_msg', 'turn_context', 'token_usage_record', 'world_state'].includes(row.type)) throw new Error('Unsupported Codex rollout row type');
+    }
+    const exposedModel = parser === 'claude-jsonl-v1' ? row.message?.model : parser === 'codex-rollout-v1' ? model : row.data?.model;
+    if (typeof exposedModel === 'string') {
+      if (exposedModel.length > 160) throw new Error('Unsupported source model identity');
+      for (let i = firstEvent; i < output.length; i++) output[i].model = exposedModel;
     }
   }
   if (!associated) throw new Error('Transcript lacks verified repository/session metadata');
@@ -146,49 +171,69 @@ function hookEvents(value: Record<string, any>, event: string, delivery: string)
   const call = value.tool_use_id ?? value.tool_call_id ?? null;
   if (event === 'UserPromptSubmit' && typeof value.prompt === 'string') return [parsed(`prompt:${value.prompt_id ?? value.turn_id ?? delivery}`, 'user_message', value.prompt, timestamp)];
   if (event === 'PreToolUse') return [parsed(`call:${call ?? delivery}`, 'tool_call', { name: value.tool_name, input: value.tool_input }, timestamp, call)];
-  if (event === 'PostToolUse') return [parsed(`result:${call ?? delivery}`, 'tool_result', value.tool_response ?? value.tool_result, timestamp, call)];
+  if (event === 'PostToolUse') return [parsed(`result:${call ?? delivery}`, 'tool_result', value.tool_response ?? value.tool_result?.text_result_for_llm ?? value.tool_result, timestamp, call)];
   if (event === 'PostToolUseFailure') return [parsed(`failure:${call ?? delivery}`, 'tool_result', { error: value.error ?? 'Tool failed' }, timestamp, call)];
   if (event === 'Stop' && typeof value.last_assistant_message === 'string') return [parsed(`reply:${value.turn_id ?? value.message_id ?? delivery}`, 'assistant_message', value.last_assistant_message, timestamp)];
   if (['PreCompact', 'PostCompact'].includes(event)) return [parsed(`compact-hook:${delivery}`, 'compaction_boundary', 'Source emitted ' + event + '. Any summary is generated, not original conversation.', timestamp)];
   return [];
 }
 
-export function enableAdapter(repo: Repo, hostName: string, options: { parser?: string; surface?: string; hostVersion?: string; extensionVersion?: string } = {}) {
+export function recorderHookMatches(entry: any, installation: { hook_entry?: Record<string, unknown>; command: string | null }) {
+  const expected = installation.hook_entry;
+  if (!entry || typeof entry !== 'object') return false;
+  if (!expected) return installation.command !== null && entry.command === installation.command && entry.args === undefined;
+  return JSON.stringify([entry.command ?? null, entry.exec ?? null, entry.args ?? null]) === JSON.stringify([expected.command ?? null, expected.exec ?? null, expected.args ?? null]);
+}
+
+export function enableAdapter(repo: Repo, hostName: string, options: { parser?: string; surface?: string; hostVersion?: string; extensionVersion?: string; workspaceRoot?: string } = {}) {
   const host = adapter(hostName); const spec = ADAPTERS[host];
   const parser = options.parser ?? spec.parser;
   if (![spec.parser, 'none'].includes(parser as any)) throw new Error('Unsupported parser version');
   const surface = options.surface ?? (host === 'codex-desktop' ? 'desktop' : host.endsWith('export') ? 'import' : host.endsWith('cli') || host.endsWith('cloud') ? 'cli' : 'extension');
   if (!['extension', 'cli', 'desktop', 'import'].includes(surface)) throw new Error('Unknown host surface');
   const configPath = surface === 'import' ? null : spec.config;
+  const configRoot = realpathSync(options.workspaceRoot ?? repo.root); const rel = relative(configRoot, repo.root);
+  if (rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)) throw new Error('Adapter workspace must contain the selected repository');
   return locked(repo, () => {
     config(repo); finishCapture(repo); const state = captureState(repo);
     const cli = fileURLToPath(new URL(import.meta.url.endsWith('.ts') ? './cli.ts' : './cli.js', import.meta.url));
     const quote = (input: string) => "'" + input.replaceAll("'", "'\\''") + "'";
-    // Installer currently generates POSIX commands; Windows capture remains an explicit compatibility gate.
-    if (process.platform === 'win32' && configPath) throw new Error('Automatic Windows host configuration is not yet verified; use explicit imports');
-    const command = `${quote(process.execPath)} ${quote(cli)} capture ${host} --input -`;
-    if (configPath) {
-      const parts = configPath.split('/'); let path = repo.root;
-      for (const part of parts.slice(0, -1)) { path = join(path, part); privateDirectory(path); }
-      const destination = join(repo.root, configPath); assertPlain(destination, false);
+    const direct = host === 'claude-code' || host === 'copilot-cli';
+    if (process.platform === 'win32' && configPath && !direct) throw new Error('Automatic Windows setup is available for claude-code and copilot-cli; use explicit imports for this host');
+    const command = `${quote(process.execPath)} ${quote(cli)} capture ${host} --repo ${quote(repo.root)} --input -`;
+    const entry: Record<string, unknown> = direct
+      ? { type: 'command', [host === 'copilot-cli' ? 'exec' : 'command']: process.execPath, args: [cli, 'capture', host, '--repo', repo.root, '--input', '-'], timeout: 15 }
+      : { type: 'command', command, timeout: 15 };
+    const previous = state.installations[host];
+    const events = ['SessionStart', 'UserPromptSubmit', 'PreToolUse', 'PostToolUse', 'Stop', 'PreCompact'];
+    const rewrite = (destination: string, add: boolean) => {
+      assertPlain(destination, false);
       const original: any = existsSync(destination) ? readJSON(destination) : {};
       if (!original || typeof original !== 'object' || Array.isArray(original) || original.hooks && (typeof original.hooks !== 'object' || Array.isArray(original.hooks))) throw new Error('Existing hook configuration has an unsupported shape');
       original.hooks ??= {};
-      if (host.startsWith('copilot-')) original.version ??= 1;
-      for (const name of ['SessionStart', 'UserPromptSubmit', 'PreToolUse', 'PostToolUse', 'Stop', 'PreCompact']) {
-        const entry = { type: 'command', command, timeout: 15 };
-        const next = host.startsWith('copilot-') ? entry : { hooks: [entry] };
+      if (host.startsWith('copilot-') && add) original.version ??= 1;
+      for (const name of events) {
         const entries = original.hooks[name] ?? [];
         if (!Array.isArray(entries)) throw new Error('Existing hook event must be an array');
-        const previousCommand = state.installations[host]?.command;
-        original.hooks[name] = entries.filter((item: any) => {
-          if (host.startsWith('copilot-')) return item.command !== command && item.command !== previousCommand;
-          return !Array.isArray(item.hooks) || item.hooks.length !== 1 || ![command, previousCommand].includes(item.hooks[0]?.command);
-        }).concat([next]);
+        const owns = (item: any) => recorderHookMatches(item, { hook_entry: entry, command }) || Boolean(previous && recorderHookMatches(item, previous));
+        original.hooks[name] = entries.flatMap((item: any) => {
+          if (owns(item)) return [];
+          if (!Array.isArray(item?.hooks)) return [item];
+          const hooks = item.hooks.filter((hook: any) => !owns(hook));
+          return hooks.length ? [{ ...item, hooks }] : [];
+        }).concat(add ? [host.startsWith('copilot-') ? entry : { hooks: [entry] }] : []);
       }
       atomicWrite(destination, json(original));
+    };
+    const destination = configPath ? join(configRoot, configPath) : null;
+    const previousDestination = previous?.config_path ? join(previous.config_root ?? repo.root, previous.config_path) : null;
+    if (previousDestination && previousDestination !== destination && existsSync(previousDestination)) rewrite(previousDestination, false);
+    if (destination) {
+      const parts = configPath!.split('/'); let path = configRoot;
+      for (const part of parts.slice(0, -1)) { path = join(path, part); privateDirectory(path); }
+      rewrite(destination, true);
     }
-    state.installations[host] = { parser, surface: surface as Installation['surface'], host_version: options.hostVersion ?? null, extension_version: options.extensionVersion ?? null, config_path: configPath, command: configPath ? command : null };
+    state.installations[host] = { hook_entry: configPath ? entry : undefined, node_executable: process.execPath, recorder_executable: cli, parser, surface: surface as Installation['surface'], host_version: options.hostVersion ?? null, extension_version: options.extensionVersion ?? null, config_root: configPath ? configRoot : null, workspace_root: configRoot, config_path: configPath, command: configPath ? command : null };
     atomicWrite(join(repo.stateDir, 'capture.json'), json(state));
     return { host, configured: true, automatic_hook_configuration: Boolean(configPath), capture_gate: 'unverified', parser, surface };
   });
@@ -208,7 +253,9 @@ function finishCapture(repo: Repo) {
 function captureNow(repo: Repo, hostName: string, raw: unknown, deliveryId?: string, spoolRedaction?: { rules: string[]; omissions: string[] }) {
   const host = adapter(hostName); const value = object(raw, 'hook input') as Record<string, any>;
   const session = identifier(value.session_id ?? value.sessionId, 'session_id');
-  if (typeof value.cwd !== 'string' || !isAbsolute(value.cwd) || repository(value.cwd).root !== repo.root) throw new Error('Hook cwd must belong to the current worktree; split execution is unsupported');
+  const configured = captureState(repo).installations[host];
+  if (!configured) throw new Error('Enable this adapter before capture');
+  if (!associatedPath(value.cwd, repo, configured.workspace_root ?? repo.root)) throw new Error('Hook cwd must belong to the current worktree or its bound workspace');
   const event = value.hook_event_name;
   if (!['SessionStart', 'UserPromptSubmit', 'PreToolUse', 'PostToolUse', 'PostToolUseFailure', 'Stop', 'PreCompact', 'PostCompact', 'SessionEnd', 'Reconcile'].includes(event)) throw new Error('Unsupported hook event');
   const delivery = deliveryId ? identifier(deliveryId, 'delivery ID') : typeof value.timestamp === 'string' ? hash(value.timestamp + event) : randomUUID();
@@ -231,13 +278,15 @@ function captureNow(repo: Repo, hostName: string, raw: unknown, deliveryId?: str
     if (transcriptPath && installed.parser !== 'none') {
       try {
         if (typeof transcriptPath !== 'string' || !isAbsolute(transcriptPath)) throw new Error('Transcript path must be absolute');
+        // Keep delayed sources reachable even when the final hook precedes their first flush.
+        entry.transcript = transcriptPath;
         if (!statSync(transcriptPath).isFile() || statSync(transcriptPath).size > 32 * 1024 * 1024) throw new Error('Transcript is not a supported-size regular file');
         let data = readFileSync(transcriptPath, 'utf8');
         if (data && !data.endsWith('\n') && installed.parser !== 'chatgpt-export-v1') {
           Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
           data = readFileSync(transcriptPath, 'utf8');
         }
-        transcript = parseTranscript(host, installed.parser, data, session, repo.root);
+        transcript = parseTranscript(host, installed.parser, data, session, repo.root, installed.workspace_root ?? repo.root);
         entry.transcript = transcriptPath;
       } catch (error) { gapMessages.push(redact((error as Error).message).text); }
     } else if (['Stop', 'Reconcile', 'SessionStart'].includes(event)) gapMessages.push('No supported transcript source; only available hook fields are captured.');
@@ -272,7 +321,7 @@ function captureNow(repo: Repo, hostName: string, raw: unknown, deliveryId?: str
       const input = parseInput({ schema_version: 1, task_id: task, sequence: sequence++, timestamp: item.timestamp,
         source: { tool: ADAPTERS[host].tool, session_id: session, event_id: id, surface: installed.surface,
           host_version: installed.host_version, extension_version: installed.extension_version, locator: `${installed.parser}:${alias}` },
-        type: item.type, content: item.content, tool_call_id: item.tool_call_id });
+        type: item.type, content: item.content, model: item.model ?? null, tool_call_id: item.tool_call_id });
       const cleaned = normalize(input, identity(repo));
       if (spoolRedaction) cleaned.redaction = { rules: [...new Set([...cleaned.redaction.rules, ...spoolRedaction.rules])].sort(), omissions: [...new Set([...cleaned.redaction.omissions, ...spoolRedaction.omissions])] };
       incoming.push(cleaned); byId.set(id, cleaned); entry.aliases[alias] = id;
@@ -354,6 +403,7 @@ export function reconcile(repo: Repo) {
 
 export function captureCheck(repo: Repo, hostName: string, session: string, prompt: string, reply: string) {
   const host = adapter(hostName);
+  if (!prompt.trim() || !reply.trim()) throw new Error('Capture check requires nonempty prompt and reply text');
   const entries = journal(repo).filter(e => e.source.tool === ADAPTERS[host].tool && e.source.session_id === session);
   const checks = { prompt: entries.some(e => e.type === 'user_message' && e.content.includes(prompt)),
     reply: entries.some(e => e.type === 'assistant_message' && e.content.includes(reply)),

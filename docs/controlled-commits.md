@@ -111,15 +111,65 @@ If a stale lock blocks recovery, confirm that the recorded process **and its Git
 
 Run `reasoning reconcile` separately for queued capture deliveries. Pending history is local, so back it up before deleting a checkout or replacing a container.
 
-## Current limitations
+## Amend, merge, replay and revert
 
-Use ordinary staged development commits while evaluating this preview. The following workflows are outside its supported commit flow:
+Amend through the wrapper:
 
-- Amend or reuse-message commits, `git commit -a`, and path-limited commits.
-- Merge, rebase, cherry-pick, revert, and GitHub merge or squash commits.
+```sh
+reasoning preview --staged --amend
+reasoning commit --amend -m "Updated description"
+reasoning verify HEAD
+```
+
+This adds a new record, keeps earlier records byte for byte, references their context and fingerprints the amended change against its first parent. Root commits and message-only amendments are supported. The old containing commit hash changes as with any Git amend. Existing `post-rewrite` hooks receive Git's mapping.
+
+For merges, stage the merge before making its commit:
+
+```sh
+git merge --no-ff --no-commit feature
+# Resolve any conflicts and stage the resolved files.
+reasoning commit -m "Merge feature"
+reasoning verify HEAD
+```
+
+The merge record describes changes against the first parent and references preserved source archives. Previously archived source events are not exported twice. `git merge --squash feature` followed by `reasoning commit` is also supported while the source branch remains available locally.
+
+With native hooks installed, automatic `git merge` commits stop at the pre-merge hook because Git's automatic merge tree can already be frozen. Finish the staged merge with `reasoning commit`. An ordinary staged `git commit` after `git merge --no-commit` also uses normal commit integration. Do not bypass this gate with `--no-verify`.
+
+Clean cherry-picks and rebases preserve existing record IDs. Native hooks delegate these replay operations without adding duplicate records. Changes in the replay base can make an old fingerprint invalid; run `reasoning verify` afterward. Discussion used to resolve conflicts stays pending. Finish the Git replay, then use `reasoning commit -m "Record conflict resolution"` to save that new discussion in a follow-up record; new conversation can be committed without additional code edits.
+
+When a platform squash drops trailers, `reasoning show COMMIT` discovers preserved records from added archive files and labels their code coverage unverified. `verify` still requires a dedicated record and matching fingerprint; finding preserved discussion does not certify the platform's new commit.
+
+Revert code while retaining its audit history:
+
+```sh
+git revert --no-commit COMMIT_TO_REVERT
+git restore --source=HEAD --staged --worktree -- .ai-history/records
+reasoning commit -m "Revert change and retain its history"
+```
+
+Review the staged diff and retain the project policy too if reverting the first recorder commit. Recorder commits reject archive deletions or edits. These commands intentionally preserve the earlier archive even though its code is reverted.
+
+Native `git commit -a` is tested with Git's full temporary index: tracked edits and the new archive reach the commit, untracked files remain untracked, and failed hooks preserve the user's original index. Path-limited commits use a different temporary-index workflow and are rejected before recorder mutation; stage the desired paths and use an ordinary commit.
+
+## Remaining compatibility limits
+
+- Native `git commit --amend` and reuse-message forms: use the wrapper with a new message and `--amend` when appropriate.
+- Automatic merges, platform-generated commits, and path-limited commits: use the supported workflows above; CI detects missing dedicated coverage.
 - Recursive commit hooks, unsupported hook managers and newer Git `hook.*` configuration.
 - Shared live state across machines or network-filesystem locking.
+- Live editor Commit buttons, interactive signing and Windows assistant execution require their own environment checks. Direct Windows hook configuration is implemented for Claude Code and Copilot CLI.
 
-Some Git operations bypass hooks entirely. Installing native hooks does not make those operations covered; use CI checks to detect unrecorded commits. Interactive commit signing remains unverified.
+The local journal is limited to 32 MiB per worktree. There is no automatic pruning, and very large archives require increasing scan time. See the [acceptance status](implementation-status.md) for automated evidence and gates that still need real hosts.
 
-The local journal is limited to 32 MiB per worktree. There is no automatic pruning, and very large archives require increasing scan time.
+## Resume a task on another checkout
+
+```sh
+reasoning task list
+reasoning task resume TASK_ID
+reasoning context --task TASK_ID
+```
+
+Resumption keeps the task ID and recorded objective, makes it active for new sessions and decisions, and preserves existing session bindings. Decision sequence numbers continue from archived entries. Previewing a resumed task before new capture is available shows the existing references with unavailable new capture, rather than claiming fresh conversation.
+
+Historical lookup also finds archives removed from later trees on the current branch. Search results, context citations and file explanations include a commit where each record can still be read. Lookup checks the current copy first and reports tampering instead of substituting an older valid copy. Unmerged branches, deleted refs and unreachable commits are not automatically searched or retained; retain the relevant branch/ref for those cases.

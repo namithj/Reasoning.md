@@ -1,6 +1,9 @@
 import { accessSync, constants, existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { isAbsolute, join, resolve } from 'node:path';
+import { ADAPTERS, captureState, recorderHookMatches } from './adapters.ts';
+import { installedNative } from './commits.ts';
+import type { Repo } from './storage.ts';
 import { environment, git, repository } from './storage.ts';
 import { object, redact, VERSION } from './schema.ts';
 
@@ -70,4 +73,36 @@ export function probe(host: string, cwd: string, input?: unknown, extensionRoot?
     hook_installation: 'see_doctor_capture_installations', commit_inclusion: 'see_doctor_recorder_status_client_unverified',
     capture_gate: 'unverified',
   };
+}
+
+// Report current on-disk reachability separately from historical installation state.
+export function health(repo: Repo) {
+  const reachable = (path?: string) => {
+    if (!path) return null;
+    try { accessSync(path, constants.R_OK); return statSync(path).isFile(); } catch { return false; }
+  };
+  const capture = captureState(repo);
+  const adapters = Object.fromEntries(Object.entries(capture.installations).map(([host, installation]) => {
+    let hooksPresent: boolean | null = null;
+    const configRoot = installation.config_root ?? repo.root;
+    if (installation.config_path) {
+      try {
+        const settings = JSON.parse(readFileSync(join(configRoot, installation.config_path), 'utf8'));
+        hooksPresent = ['SessionStart', 'UserPromptSubmit', 'PreToolUse', 'PostToolUse', 'Stop', 'PreCompact'].every(event =>
+          settings.hooks?.[event]?.some((entry: any) => recorderHookMatches(entry, installation) || entry.hooks?.some((hook: any) => recorderHookMatches(hook, installation))));
+      } catch { hooksPresent = false; }
+    }
+    return [host, { hook_commands_present: hooksPresent, config_root: configRoot, config_path: installation.config_path,
+      workspace_root: installation.workspace_root ?? configRoot, repository_root: repo.root,
+      recorder_readable: reachable(installation.recorder_executable), node_readable: reachable(installation.node_executable),
+      parser_supported: installation.parser === ADAPTERS[host as keyof typeof ADAPTERS]?.parser,
+      last_capture: Object.values(capture.sessions).filter(session => session.host === host).map(session => session.last_capture).sort().at(-1) ?? null,
+      live_panel_verified: false }];
+  }));
+  const native = installedNative(repo);
+  return { adapters, git: native ? {
+    configured: true, hooks_path_matches: resolve(git(repo.root, ['rev-parse', '--path-format=absolute', '--git-path', 'hooks']).trim()) === resolve(native.directory),
+    hooks_present: ['pre-commit', 'prepare-commit-msg', 'commit-msg', 'post-commit', 'reference-transaction'].every(name => reachable(join(native.directory, name))),
+    recorder_readable: reachable(native.recorder_executable), node_readable: reachable(native.node_executable), editor_commit_verified: false,
+  } : { configured: false, editor_commit_verified: false } };
 }

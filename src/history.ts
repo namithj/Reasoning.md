@@ -15,6 +15,17 @@ export function tasks(repo: Repo): Tasks {
   if (value.schema_version !== 1 || !value.tasks || !value.bindings || typeof value.tasks !== 'object' || typeof value.bindings !== 'object') throw new Error('Invalid local task state');
   return value;
 }
+export function listTasks(repo: Repo): Tasks {
+  const state = tasks(repo);
+  for (const record of archivedRecords(repo)) {
+    const id = record.manifest.task_id;
+    if (!id) continue;
+    const objective = record.eventData.split('\n').filter(Boolean).map(line => JSON.parse(line)).find(event => event.source?.locator === 'task:start');
+    if (!state.tasks[id] || objective && state.tasks[id].title === `Archived task ${id}`) state.tasks[id] = { title: objective?.content ?? `Archived task ${id}`, created_at: record.manifest.capture_boundary.frozen_at };
+  }
+  return state;
+}
+
 export const bindingKey = (host: string, session: string) => JSON.stringify([host, session]);
 
 export function startTask(repo: Repo, title: string) {
@@ -30,10 +41,21 @@ export function startTask(repo: Repo, title: string) {
   });
 }
 
+export function resumeTask(repo: Repo, task: string) {
+  identifier(task, 'task');
+  return locked(repo, () => {
+    const state = listTasks(repo);
+    if (!Object.hasOwn(state.tasks, task)) throw new Error('Unknown task; run reasoning task list');
+    state.active = task;
+    atomicWrite(join(repo.stateDir, 'tasks.json'), json(state));
+    return { task_id: task, ...state.tasks[task], active: true };
+  });
+}
+
 export function bindTask(repo: Repo, host: string, session: string, task: string) {
   identifier(host, 'host'); identifier(session, 'session'); identifier(task, 'task');
   return locked(repo, () => {
-    const state = tasks(repo);
+    const state = listTasks(repo);
     if (!Object.hasOwn(state.tasks, task)) throw new Error('Unknown local task');
     const key = bindingKey(host, session);
     const capturePath = join(repo.stateDir, 'capture.json');
@@ -52,7 +74,7 @@ export function decision(repo: Repo, content: string, task?: string) {
     if (!selected) throw new Error('Choose --task or start a task first');
     identifier(selected, 'task');
     const session = `decisions-${selected}`;
-    const previous = journal(repo).filter(event => event.source.tool === 'manual' && event.source.session_id === session);
+    const previous = history(repo).map(({ event }) => event).filter(event => event.source.tool === 'manual' && event.source.session_id === session);
     const sequence = previous.reduce((n, event) => Math.max(n, event.sequence + 1), 0);
     const input = parseInput({ schema_version: 1, task_id: selected, sequence, timestamp: new Date().toISOString(),
       source: { tool: 'manual', session_id: session, event_id: randomUUID(), surface: 'cli', locator: 'decision:explicit' },
@@ -63,27 +85,41 @@ export function decision(repo: Repo, content: string, task?: string) {
 }
 
 export function archivedRecords(repo: Repo) {
-  const commit = head(repo); if (!commit) return [];
-  return git(repo.root, ['ls-tree', '-r', '--name-only', '-z', commit, '--', '.ai-history/records']).split('\0').flatMap(path => {
+  const tip = head(repo); if (!tip) return [];
+  const records = new Map<string, ReturnType<typeof recordAt> & { commit: string }>();
+  const inspect = (commit: string, path: string) => {
     const match = /^\.ai-history\/records\/([0-9a-f-]{36})\/manifest\.json$/.exec(path);
-    if (!match) return [];
+    if (!match || records.has(match[1])) return;
     let value;
     try { value = JSON.parse(git(repo.root, ['show', `${commit}:${path}`])); } catch { throw new Error('Invalid archived manifest'); }
-    if (value.snapshot === true) return [];
-    return [recordAt(repo, commit, match[1])];
-  });
+    if (value.snapshot === true) return;
+    if (records.size >= 10000) throw new Error('History exceeds the 10000-record lookup limit');
+    records.set(match[1], { ...recordAt(repo, commit, match[1]), commit });
+  };
+  // Inspect the current tree first so historical copies never conceal current tampering.
+  for (const path of git(repo.root, ['ls-tree', '-r', '--name-only', tip, '--', '.ai-history/records']).split('\n')) {
+    const directory = /^(\.ai-history\/records\/[0-9a-f-]{36})\//.exec(path)?.[1];
+    if (directory) inspect(tip, `${directory}/manifest.json`);
+  }
+  // ponytail: scan archive additions on this branch; add a rebuildable index before large histories.
+  let commit = tip;
+  for (const line of git(repo.root, ['log', '--format=%H', '--name-only', '--diff-filter=A', '--no-renames', '--full-history', '-m', tip, '--', '.ai-history/records']).split('\n')) {
+    if (/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(line)) commit = line;
+    else inspect(commit, line);
+  }
+  return [...records.values()].sort((a, b) => a.manifest.capture_boundary.frozen_at.localeCompare(b.manifest.capture_boundary.frozen_at) || a.manifest.record_id.localeCompare(b.manifest.record_id));
 }
 
 export function history(repo: Repo) {
-  const found = new Map<string, { event: Event; record_id: string | null }>();
+  const found = new Map<string, { event: Event; record_id: string | null; commit: string | null }>();
   for (const record of archivedRecords(repo)) {
     for (const line of record.eventData.split('\n').filter(Boolean)) {
       const event = JSON.parse(line) as Event;
-      found.set(event.event_id, { event, record_id: record.manifest.record_id });
+      found.set(event.event_id, { event, record_id: record.manifest.record_id, commit: record.commit });
     }
   }
   if (existsSync(join(repo.root, '.ai-history', 'config.json'))) {
-    for (const event of journal(repo)) if (!found.has(event.event_id)) found.set(event.event_id, { event, record_id: null });
+    for (const event of journal(repo)) if (!found.has(event.event_id)) found.set(event.event_id, { event, record_id: null, commit: null });
   }
   return [...found.values()];
 }
@@ -92,7 +128,7 @@ export function search(repo: Repo, query: string) {
   if (!query.trim()) throw new Error('Search requires text');
   const needle = query.toLocaleLowerCase();
   const matches = history(repo).filter(({ event }) => event.content.toLocaleLowerCase().includes(needle));
-  return { matches: matches.slice(0, 100).map(({ event, record_id }) => ({ record_id, event_id: event.event_id,
+  return { matches: matches.slice(0, 100).map(({ event, record_id, commit }) => ({ record_id, commit, event_id: event.event_id,
     task_id: event.task_id, type: event.type, excerpt: redact(event.content).text.slice(0, 1000) })), truncated: matches.length > 100 };
 }
 
@@ -106,9 +142,9 @@ export function context(repo: Repo, task: string, limit = 12000) {
   const priority = [...entries.filter(({ event }) => event.source.locator === 'task:start'),
     ...entries.filter(({ event }) => event.type === 'explicit_decision'), ...entries.slice().reverse()];
   const seen = new Set<string>(); let omitted = false;
-  for (const { event, record_id } of priority) {
+  for (const { event, record_id, commit } of priority) {
     if (seen.has(event.event_id)) continue; seen.add(event.event_id);
-    const quote = `\n[record:${record_id ?? 'local-uncommitted'} event:${event.event_id} type:${event.type}]\n${redact(event.content).text.split('\n').map(line => '> ' + line).join('\n')}\n`;
+    const quote = `\n[record:${record_id ?? 'local-uncommitted'} commit:${commit ?? 'uncommitted'} event:${event.event_id} type:${event.type}]\n${redact(event.content).text.split('\n').map(line => '> ' + line).join('\n')}\n`;
     if (text.length + quote.length > limit - 100) { omitted = true; continue; }
     text += quote;
   }
@@ -121,5 +157,5 @@ export function explain(repo: Repo, file: string) {
   const commits = head(repo) ? git(repo.root, ['log', '--format=%H', '-n', '100', '--', file]).trim().split('\n').filter(Boolean) : [];
   const records = archivedRecords(repo).filter(record => record.manifest.staged_code_paths.includes(file));
   return { file, interpretation: 'Recorded evidence only; no model-generated explanation or inferred authorship.', commits,
-    records: records.map(record => ({ record_id: record.manifest.record_id, task_id: record.manifest.task_id, text: record.reasoning })) };
+    records: records.map(record => ({ record_id: record.manifest.record_id, commit: record.commit, task_id: record.manifest.task_id, text: record.reasoning })) };
 }

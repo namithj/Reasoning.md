@@ -2,15 +2,15 @@ import { spawnSync } from 'node:child_process';
 import { chmodSync, existsSync, readFileSync, rmSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { atomicWrite, config, git, locked, privateDirectory, syncDirectory } from './storage.ts';
+import { atomicWrite, config, git, locked, privateDirectory, syncDirectory, repository } from './storage.ts';
 import type { Repo } from './storage.ts';
 import { cleanFailed, finalize, head, installedNative, pending, prepareCommit, runHook } from './commits.ts';
 import { reconcile } from './adapters.ts';
 import { tasks } from './history.ts';
 import { json } from './schema.ts';
 
-const NATIVE_HOOKS = ['pre-commit', 'prepare-commit-msg', 'commit-msg', 'post-commit', 'reference-transaction'];
-const DELEGATED_HOOKS = ['applypatch-msg', 'pre-applypatch', 'post-applypatch', 'pre-merge-commit', 'pre-rebase', 'post-checkout', 'post-merge', 'pre-push', 'pre-receive', 'update', 'proc-receive', 'post-receive', 'post-update', 'push-to-checkout', 'pre-auto-gc', 'post-rewrite', 'sendemail-validate', 'fsmonitor-watchman', 'p4-changelist', 'p4-prepare-changelist', 'p4-post-changelist', 'p4-pre-submit', 'post-index-change'];
+const NATIVE_HOOKS = ['pre-merge-commit', 'pre-commit', 'prepare-commit-msg', 'commit-msg', 'post-commit', 'reference-transaction'];
+const DELEGATED_HOOKS = ['applypatch-msg', 'pre-applypatch', 'post-applypatch', 'pre-rebase', 'post-checkout', 'post-merge', 'pre-push', 'pre-receive', 'update', 'proc-receive', 'post-receive', 'post-update', 'push-to-checkout', 'pre-auto-gc', 'post-rewrite', 'sendemail-validate', 'fsmonitor-watchman', 'p4-changelist', 'p4-prepare-changelist', 'p4-post-changelist', 'p4-pre-submit', 'post-index-change'];
 
 export function installNative(repo: Repo) {
   config(repo);
@@ -33,7 +33,7 @@ export function installNative(repo: Repo) {
         : `#!/bin/sh\nif test -x ${target}; then exec ${target} "$@"; fi\n`);
       chmodSync(path, 0o755);
     }
-    const installation = { original_hooks, prior_local: existing ? existing.prior_local : (prior.status === 0 ? prior.stdout.trim() : null), directory };
+    const installation = { node_executable: process.execPath, recorder_executable: cli, original_hooks, prior_local: existing ? existing.prior_local : (prior.status === 0 ? prior.stdout.trim() : null), directory };
     atomicWrite(join(repo.commonState, 'native-installation.json'), json(installation));
     git(repo.root, ['config', '--local', 'core.hooksPath', directory]);
     return { installed: true, scope: 'repository_and_linked_worktrees', original_hooks, directory, ide_commit_gate: 'unverified' };
@@ -45,7 +45,9 @@ export function uninstallNative(repo: Repo) {
     const state = installedNative(repo); if (!state) return { installed: false };
     const actual = git(repo.root, ['rev-parse', '--path-format=absolute', '--git-path', 'hooks']).trim();
     if (resolve(actual) !== resolve(state.directory)) throw new Error('Hook configuration changed; refusing to overwrite it');
-    if (existsSync(join(repo.stateDir, 'transaction.json'))) throw new Error('Recover the pending transaction before removing native hooks');
+    for (const field of git(repo.root, ['worktree', 'list', '--porcelain', '-z']).split('\0')) {
+      if (field.startsWith('worktree ') && existsSync(join(repository(field.slice(9)).stateDir, 'transaction.json'))) throw new Error('Recover pending transactions in every worktree before removing native hooks');
+    }
     if (state.prior_local === null) git(repo.root, ['config', '--local', '--unset', 'core.hooksPath']);
     else git(repo.root, ['config', '--local', 'core.hooksPath', state.prior_local]);
     rmSync(join(repo.commonState, 'native-installation.json')); syncDirectory(repo.commonState);
@@ -65,11 +67,16 @@ export function original(repo: Repo, name: string, args: string[], input?: strin
 export function nativeHook(repo: Repo, name: string, args: string[], input?: string) {
   if (!NATIVE_HOOKS.includes(name)) throw new Error('Unsupported native hook');
   const installation = installedNative(repo); if (!installation) throw new Error('Native integration is not installed');
+  if (name === 'pre-merge-commit') { original(repo, name, args); throw new Error('Automatic merge trees are frozen before recorder hooks. Finish with reasoning commit -m MESSAGE, or start merges with git merge --no-commit'); }
   const transaction = join(repo.stateDir, 'transaction.json');
   const normalIndex = resolve(repo.gitDir, 'index');
   const actualIndex = process.env.GIT_INDEX_FILE ? resolve(repo.root, process.env.GIT_INDEX_FILE) : normalIndex;
-  // Keep temporary-index behavior gated until independently verified; never attach to the wrong index.
-  if (actualIndex !== normalIndex && ['pre-commit', 'prepare-commit-msg'].includes(name)) throw new Error('This Git commit uses a temporary index; use an ordinary staged commit');
+  // Git copies its full temporary index back after -a; path-limited indexes have different semantics.
+  if (actualIndex !== normalIndex && actualIndex !== normalIndex + '.lock' && ['pre-commit', 'prepare-commit-msg'].includes(name)) throw new Error('This Git commit uses a temporary index; use an ordinary staged commit');
+  // Replays preserve their original records. New resolution discussion stays pending for a follow-up.
+  if (!existsSync(transaction) && ['CHERRY_PICK_HEAD', 'rebase-merge', 'rebase-apply'].some(marker => existsSync(join(repo.gitDir, marker)))) {
+    original(repo, name, args, input); return;
+  }
   try {
     if (name === 'pre-commit') {
       original(repo, name, args);

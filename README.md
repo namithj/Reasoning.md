@@ -6,7 +6,7 @@ The npm package is `@namithj/reasoning.md`; the command is `reasoning`.
 
 Save accessible development conversations alongside the Git commits they explain. Records contain readable text, structured events, source references and a fingerprint of the staged code. No cloud service, model call or external dependency is required.
 
-**0.1.0-alpha.3 · MIT · experimental.** Includes host capture, durable reconciliation, controlled commits, opt-in native Git hooks, decision capture, cited task handoffs and a reusable CI verifier. Real extension-panel and Source Control compatibility remain unverified. Copilot VS Code currently captures exposed hook fields only; its full-transcript parser is unavailable. See [adapter scope and limitations](docs/adapters.md).
+**0.1.0-alpha.3 · MIT · experimental.** Includes host capture, durable reconciliation, controlled commits, opt-in native Git hooks, decision capture, cited task handoffs and a reusable CI verifier. Real extension-panel and Source Control compatibility remain unverified. Copilot VS Code imports and reconciles v1 session-event transcripts, including full exposed replies and tool activity. See [adapter scope and limitations](docs/adapters.md) and the [implementation and acceptance status](docs/implementation-status.md).
 
 ## Install
 
@@ -24,6 +24,8 @@ reasoning --help
 
 ### Alternative: build locally
 
+Use this route for the changes in this checkout; the published npm preview may contain an earlier implementation.
+
 If the npm preview is unavailable or you want to build from source, download or clone [namithj/Reasoning.md](https://github.com/namithj/Reasoning.md). Open a terminal in the checkout directory containing `package.json`, then run:
 
 ```sh
@@ -36,19 +38,26 @@ If you already have a compiled package, you can install it directly with `npm in
 
 ## How to Use
 
-Open a terminal in your existing Git project and initialize it:
+Open a terminal in your existing Git project or its workspace parent and initialize it:
 
 ```sh
 reasoning init --publication private
 ```
 
-Use `--publication public` instead for records intended for public sharing. Then choose the setup for your assistant below (Linux or macOS).
+When the current directory is not a Git checkout, `init` discovers a sole nested worktree such as `public/.git`, records the workspace-to-repository binding locally, and configures enabled adapters against that workspace. If several repositories are found at the nearest depth, select one with `--repo PATH`. Use `--publication public` instead for records intended for public sharing. Then choose the setup for your assistant below. Claude Code and Copilot CLI use direct executable hooks on Linux, macOS and Windows; other automatic adapters currently use Linux/macOS shell hooks.
 
 ### Claude Code
 
 ```sh
 reasoning adapter enable claude-code
 reasoning skill install --host claude-code
+```
+
+### Copilot in VS Code
+
+```sh
+reasoning adapter enable copilot-vscode
+reasoning skill install --host copilot-vscode
 ```
 
 ### Codex
@@ -64,13 +73,13 @@ The adapter configures conversation capture; the skill gives your assistant inst
 reasoning doctor
 ```
 
-`doctor` reports configuration and capture gaps; verify a real exchange with the [capture check](docs/adapters.md#verify-capture). On Windows, use [transcript imports](docs/adapters.md#explicit-imports) because automatic adapter setup is currently unavailable.
+`doctor` reports configuration and capture gaps; verify a real exchange with the [capture check](docs/adapters.md#verify-capture). On Windows, Claude Code and Copilot CLI support automatic setup; use [transcript imports](docs/adapters.md#explicit-imports) for other hosts until their Windows launchers are verified.
 
 When you are ready to save a conversation with your changes, follow the [commit guide](docs/controlled-commits.md).
 
 ## Retrieve the discussion
 
-Use `reasoning task list` to find the `TASK_ID` used below.
+Use `reasoning task list` to find the `TASK_ID` used below. Run `reasoning task resume TASK_ID` to make an existing task active for new sessions and decision entries, including on a fresh clone.
 
 ```sh
 reasoning decision "Keep the old API because existing callers depend on it" --task TASK_ID
@@ -80,7 +89,7 @@ reasoning explain --file path/to/your-change
 reasoning show HEAD
 ```
 
-Context packets quote saved evidence and cite event/record IDs. They do not invent conclusions or execute historical instructions. Tracked history works on a fresh clone without the original assistant account. Pending local conversations do not travel with a clone.
+Context packets quote saved evidence and cite event/record IDs. They do not invent conclusions or execute historical instructions. Tracked history works on a fresh clone without the original assistant account. Pending local conversations do not travel with a clone. Search, context and file explanations also inspect records retained in the current branch’s Git history after later archive removals, and cite a commit where the evidence remains readable.
 
 ## Available commands
 
@@ -93,13 +102,13 @@ reasoning status --format json
 
 `--format json` wraps the text reports from `show`, `preview` and `context` in a `text` field. Help and version output stay plain text; assistant hooks keep their stdout empty.
 
-Run these commands as `reasoning COMMAND` from your project's Git directory. Replace uppercase placeholders with your own values. Use `reasoning --help` for all options or `reasoning --version` to check the installed version.
+Run these commands as `reasoning COMMAND` from the initialized repository or its bound workspace. Use `--repo PATH` to select a repository explicitly when discovery is ambiguous. Replace uppercase placeholders with your own values. Use `reasoning --help` for all options or `reasoning --version` to check the installed version.
 
 ### Setup and health
 
 | Command | What it does |
 | --- | --- |
-| `init --publication private` | Initialize the project; use `public` for records intended for public sharing. |
+| `init --publication private [--repo PATH]` | Discover and initialize the project; use `public` for records intended for public sharing. |
 | `doctor` | Report configuration, assistant environment and capture gaps. |
 | `status` | Show captured events, sessions, queued deliveries and pending work. |
 | `adapter enable HOST` | Configure capture for an assistant. |
@@ -116,7 +125,7 @@ Run these commands as `reasoning COMMAND` from your project's Git directory. Rep
 | `capture HOST --input FILE` | Process an assistant hook payload; normally called by configured hooks. |
 | `reconcile` | Retry queued capture and read updates from known transcripts. |
 | `preview --staged` | Show the conversation record proposed for your staged changes. |
-| `commit -m "MESSAGE"` | Commit staged changes with their conversation record. |
+| `commit -m "MESSAGE"` | Commit staged changes with their conversation record; add `--amend` to replace the current commit while retaining its earlier archive. |
 | `export --staged` | Write a standalone snapshot without staging or committing it. |
 | `verify COMMIT` | Check a record's integrity and association with a commit. |
 | `verify-range BASE..HEAD` | Check every commit in a range. |
@@ -130,7 +139,8 @@ Run these commands as `reasoning COMMAND` from your project's Git directory. Rep
 | Command | What it does |
 | --- | --- |
 | `task start "OBJECTIVE"` | Create a task and make it active for new sessions. |
-| `task list` | List tasks, their IDs and session bindings. |
+| `task resume ID` | Activate a saved task for new sessions without duplicating its objective or changing existing session bindings. |
+| `task list` | List local and archived tasks, their IDs and local session bindings, including on a fresh clone. |
 | `task bind TOOL SESSION --task ID` | Associate an assistant session with a task. |
 | `decision "RATIONALE" --task ID` | Save an explicit decision for the next record. |
 | `search "TEXT"` | Search local and committed conversation history. |
@@ -159,7 +169,7 @@ npm run check:package
 npm pack
 ```
 
-The full test suite creates and commits in disposable Git repositories. GitHub Actions defines Linux/macOS/Windows checks and package artifacts. Publishing a GitHub Release triggers npm publication to `next` after Linux tests, build and package checks; it requires npm authentication configured for `.github/workflows/publish.yml`. The release tag must be `v` followed by the matching version in `package.json` and `src/schema.ts`. Native Windows host configuration is unavailable; Windows capture tests use explicit imports.
+The full test suite creates and commits in disposable Git repositories. `check:package` also packs and installs the actual tarball offline, then checks setup, commits, native hooks and fresh-clone retrieval. GitHub Actions defines Linux/macOS/Windows checks and package artifacts. Publishing a GitHub Release triggers npm publication to `next` after Linux tests, build and package checks; it requires npm authentication configured for `.github/workflows/publish.yml`. The release tag must be `v` followed by the matching version in `package.json` and `src/schema.ts`. Windows direct-hook tests cover Claude Code and Copilot CLI. Other Windows capture paths use explicit imports; real host-panel compatibility remains a separate gate.
 
 The software repository ignores `.ai-history/`; the npm package uses an explicit allowlist. In projects recording their own history, keep reviewed records trackable and add `.ai-history export-ignore` to that project's `.gitattributes` if release archives should omit them. This affects `git archive`, not clones.
 

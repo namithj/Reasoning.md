@@ -7,11 +7,12 @@ import { config, git, gitBytes, identity, locked, privateDirectory, atomicWrite,
 import type { Repo } from './storage.ts';
 import { journal, snapshot, staged, writeRecord } from './recorder.ts';
 import type { RecordData } from './recorder.ts';
+import { tasks } from './history.ts';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const OID = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/;
 const FILES = ['reasoning.txt', 'events.jsonl', 'manifest.json'] as const;
-const HOOKS = ['pre-commit', 'prepare-commit-msg', 'commit-msg', 'post-commit', 'reference-transaction'] as const;
+const HOOKS = ['pre-commit', 'prepare-commit-msg', 'commit-msg', 'post-commit', 'reference-transaction', 'post-rewrite'] as const;
 const pathFor = (id: string, file: string) => `.ai-history/records/${id}/${file}`;
 const transactionPath = (repo: Repo) => join(repo.stateDir, 'transaction.json');
 
@@ -21,7 +22,7 @@ type Transaction = {
   repository_id: string; worktree_id: string; files: Record<string, string>;
 };
 
-export function installedNative(repo: Repo): { original_hooks: string; prior_local: string | null; directory: string } | null {
+export function installedNative(repo: Repo): { node_executable?: string; recorder_executable?: string; original_hooks: string; prior_local: string | null; directory: string } | null {
   const path = join(repo.commonState, 'native-installation.json');
   if (!existsSync(path)) return null;
   const value = readJSON(path) as any;
@@ -108,14 +109,16 @@ export function verify(repo: Repo, ref = 'HEAD') {
   const id = trailer(git(repo.root, ['show', '-s', '--format=%B', commit]));
   const primary = recordAt(repo, commit, id);
   const parents = git(repo.root, ['show', '-s', '--format=%P', commit]).trim().split(' ').filter(Boolean);
-  if (parents.length > 1) throw new Error('Merge commit verification is not supported by the controlled wrapper');
   const raw = gitBytes(repo.root, ['diff-tree', '--root', '--no-commit-id', '--raw', '-r', '-z', '--no-abbrev', '--no-renames',
-    commit, '--', ':(top)**', ':(top,exclude).ai-history/records/**']);
-  const archiveChanges = git(repo.root, ['diff-tree', '--root', '--no-commit-id', '--name-status', '-r', '-z', '--no-renames', commit, '--', '.ai-history/records']).split('\0').filter(Boolean);
-  if (archiveChanges.length !== 6 || !FILES.every(file => {
-    const i = archiveChanges.indexOf(pathFor(id, file));
+    ...(parents.length ? [parents[0], commit] : [commit]), '--', ':(top)**', ':(top,exclude).ai-history/records/**']);
+  const archiveChanges = git(repo.root, ['diff-tree', '--root', '--no-commit-id', '--name-status', '-r', '-z', '--no-renames', ...(parents.length ? [parents[0], commit] : [commit]), '--', '.ai-history/records']).split('\0').filter(Boolean);
+  const preserved = primary.manifest.preserved_records ?? {};
+  if (!preserved || typeof preserved !== 'object' || Array.isArray(preserved) || Object.entries(preserved).some(([key, digest]) => !UUID.test(key) || key === id || typeof digest !== 'string' || !/^[a-f0-9]{64}$/.test(digest))) throw new Error('Invalid preserved record list');
+  const addedIds = [id, ...Object.keys(preserved)];
+  if (archiveChanges.length !== addedIds.length * 6 || !addedIds.every(added => FILES.every(file => {
+    const i = archiveChanges.indexOf(pathFor(added, file));
     return i > 0 && archiveChanges[i - 1] === 'A';
-  })) throw new Error('Commit must add only its new record and preserve earlier archives');
+  }))) throw new Error('Commit must add only its new record and preserve earlier archives');
   if (hash(raw) !== primary.manifest.staged_code_fingerprint) throw new Error('Committed code fingerprint differs from the record');
   if (parents.length && git(repo.root, ['ls-tree', parents[0], '--', `.ai-history/records/${id}`]).length) {
     throw new Error('Containing commit reused an earlier record ID');
@@ -135,15 +138,42 @@ export function verify(repo: Repo, ref = 'HEAD') {
     visiting.delete(current); visited.add(current);
   }
   visit(id);
+  for (const [previous, digest] of Object.entries(preserved)) {
+    if (hash(git(repo.root, ['show', `${commit}:${pathFor(previous, 'manifest.json')}`])) !== digest) throw new Error('Preserved record manifest changed');
+    visit(previous);
+  }
   return { commit, record_id: id, capture_status: primary.manifest.capture_status, records };
 }
 
 export function show(repo: Repo, ref = 'HEAD') {
-  const result = verify(repo, ref);
-  return [...result.records.values()].map(record => record.reasoning).join('\n');
+  const commit = revision(repo, ref);
+  if (/^Reasoning-Record:/m.test(git(repo.root, ['show', '-s', '--format=%B', commit]))) {
+    const result = verify(repo, commit);
+    return [...result.records.values()].map(record => record.reasoning).join('\n');
+  }
+  const parents = git(repo.root, ['show', '-s', '--format=%P', commit]).trim().split(' ').filter(Boolean);
+  const paths = git(repo.root, ['diff-tree', '--root', '--no-commit-id', '-r', '--name-only', '-z', '--diff-filter=A',
+    ...(parents.length ? [parents[0], commit] : [commit]), '--', '.ai-history/records']).split('\0');
+  const ids = paths.flatMap(path => { const match = /^\.ai-history\/records\/([^/]+)\/manifest\.json$/.exec(path); return match ? [match[1]] : []; });
+  if (!ids.length) throw new Error('No associated records found; this commit has no Reasoning-Record trailer');
+  const records = new Map<string, RecordData>();
+  for (let i = 0; i < ids.length; i++) {
+    if (records.has(ids[i])) continue;
+    if (records.size >= 10000) throw new Error('Record reference limit exceeded');
+    const record = recordAt(repo, commit, ids[i]); records.set(ids[i], record);
+    ids.push(...record.manifest.referenced_records);
+  }
+  return 'Preserved archive evidence discovered from added files. This commit has no dedicated record trailer; its code coverage is unverified.\n\n' + [...records.values()].map(record => record.reasoning).join('\n');
 }
 
-export function commitPreview(repo: Repo, task?: string, noActivity = false) {
+export function amendmentBase(repo: Repo) {
+  const parent = head(repo);
+  if (!parent) throw new Error('Cannot amend an unborn branch');
+  if (existsSync(join(repo.gitDir, 'MERGE_HEAD'))) throw new Error('Cannot amend during a merge');
+  return git(repo.root, ['show', '-s', '--format=%P', parent]).trim().split(' ').filter(Boolean)[0] ?? git(repo.root, ['mktree']).trim();
+}
+
+export function commitPreview(repo: Repo, task?: string, noActivity = false, base?: string) {
   const parent = head(repo);
   const excludeIds = new Set<string>();
   const priorRecords: RecordData['manifest'][] = [];
@@ -163,11 +193,39 @@ export function commitPreview(repo: Repo, task?: string, noActivity = false) {
       priorRecords.push(record.manifest);
     }
   }
+  const preservedRecords: Record<string, string> = {};
+  // Preserve imported archives byte for byte; reject arbitrary staged exports and edits.
+  const tree = git(repo.root, ['write-tree']).trim();
+  const comparison = base ?? parent ?? git(repo.root, ['mktree']).trim();
+  const archiveChanges = git(repo.root, ['diff-tree', '-r', '--name-status', '-z', '--no-renames', comparison, tree, '--', '.ai-history/records']).split('\0').filter(Boolean);
+  const sources = [parent, ...['MERGE_HEAD', 'CHERRY_PICK_HEAD'].flatMap(marker => existsSync(join(repo.gitDir, marker)) ? readFileSync(join(repo.gitDir, marker), 'utf8').trim().split('\n') : [])].filter(Boolean) as string[];
+  for (let i = 0; i < archiveChanges.length; i += 2) {
+    const match = /^\.ai-history\/records\/([^/]+)\/(reasoning\.txt|events\.jsonl|manifest\.json)$/.exec(archiveChanges[i + 1]);
+    if (archiveChanges[i] !== 'A' || !match || !UUID.test(match[1])) throw new Error('Archive changes are already staged: restore archive deletions/edits before committing');
+    const id = match[1];
+    if (preservedRecords[id]) continue;
+    const inherited = recordAt(repo, tree, id);
+    if (!sources.some(source => git(repo.root, ['ls-tree', source, '--', `.ai-history/records/${id}`]) === git(repo.root, ['ls-tree', tree, '--', `.ai-history/records/${id}`]))) {
+      // ponytail: search retained history for imported archives; add a rebuildable index before large archives.
+      sources.push(...git(repo.root, ['log', '--all', '--reflog', '--format=%H', '--', `.ai-history/records/${id}`]).trim().split('\n').filter(Boolean));
+    }
+    if (inherited.manifest.repository_id !== config(repo).repository_id || !sources.some(source => git(repo.root, ['ls-tree', source, '--', `.ai-history/records/${id}`]) === git(repo.root, ['ls-tree', tree, '--', `.ai-history/records/${id}`]))) throw new Error('Archive changes are already staged without a matching source commit');
+    preservedRecords[id] = hash(git(repo.root, ['show', `${tree}:${pathFor(id, 'manifest.json')}`]));
+    inherited.manifest.capture_boundary.event_ids.forEach(id => excludeIds.add(id));
+  }
+
+  task ??= tasks(repo).active ?? undefined;
   const selectedTask = task ?? journal(repo)[0]?.task_id ?? null;
   const relevant = priorRecords.filter(previous => previous.task_id === selectedTask);
   const alreadyReferenced = new Set(relevant.flatMap(previous => previous.referenced_records));
   const references = relevant.filter(previous => !alreadyReferenced.has(previous.record_id)).map(previous => previous.record_id);
-  return snapshot(repo, task, { commit: true, excludeIds, references, noActivity });
+  const record = snapshot(repo, task, { commit: true, excludeIds, references: [...new Set([...references, ...Object.keys(preservedRecords)])], noActivity, base });
+  record.manifest.preserved_records = preservedRecords;
+  if (Object.keys(preservedRecords).length) {
+    record.reasoning += `\nPreserved source records: ${Object.keys(preservedRecords).join(', ')}\n`;
+    record.manifest.files['reasoning.txt'] = hash(record.reasoning);
+  }
+  return record;
 }
 
 export function pending(repo: Repo): Transaction {
@@ -278,24 +336,22 @@ export function recover(repo: Repo) {
   return locked(repo, () => existsSync(transactionPath(repo)) ? recoverPending(repo) : { recovered: false, pending: false });
 }
 
-export function prepareCommit(repo: Repo, task?: string, noActivity = false, originalHooks?: string, nativeMode = false, override?: string) {
-  for (const marker of ['MERGE_HEAD', 'CHERRY_PICK_HEAD', 'REVERT_HEAD', 'rebase-merge', 'rebase-apply', 'sequencer']) {
-    if (existsSync(resolve(repo.root, git(repo.root, ['rev-parse', '--git-path', marker]).trim()))) throw new Error('Merge/rebase/cherry-pick/revert transactions are not supported');
+export function prepareCommit(repo: Repo, task?: string, noActivity = false, originalHooks?: string, nativeMode = false, override?: string, amend = false) {
+  for (const marker of ['rebase-merge', 'rebase-apply']) {
+    if (existsSync(resolve(repo.root, git(repo.root, ['rev-parse', '--git-path', marker]).trim()))) throw new Error('Finish the replay with Git, then record any new conflict-resolution discussion in a follow-up commit');
   }
   const hookConfig = spawnSync('git', ['config', '--get-regexp', '^hook[.]'], { cwd: repo.root, encoding: 'utf8' });
   if (hookConfig.status !== 1) throw new Error('Config-based Git hooks are not yet supported; existing hooks were not changed');
-  if (git(repo.root, ['diff', '--cached', '--name-only', '--', '.ai-history/records']).length) {
-    throw new Error('Archive changes are already staged; controlled commits only add their own new record');
-  }
   let stagedPolicy: ReturnType<typeof config>;
   try { stagedPolicy = JSON.parse(git(repo.root, ['show', ':.ai-history/config.json'])); }
   catch { throw new Error('Stage .ai-history/config.json before the first controlled commit'); }
   if (JSON.stringify(stagedPolicy) !== JSON.stringify(config(repo))) throw new Error('Staged policy differs from the working configuration');
-  if (!staged(repo).paths.length) throw new Error('No staged code or policy changes to commit');
   const version = /git version (\d+)\.(\d+)/.exec(git(repo.root, ['--version']));
   if (!version || Number(version[1]) < 2 || Number(version[1]) === 2 && Number(version[2]) < 43) throw new Error('Controlled commits require Git 2.43 or later');
   const parent = head(repo);
-  const record = commitPreview(repo, task, noActivity);
+  const base = amend ? amendmentBase(repo) : undefined;
+  const record = commitPreview(repo, task, noActivity, base);
+  if (!amend && !record.manifest.staged_code_paths.length && !record.manifest.capture_boundary.event_ids.length && !existsSync(join(repo.gitDir, 'MERGE_HEAD'))) throw new Error('No staged code or new conversation to commit');
   if (override !== undefined) {
     if (!override.trim() || override.length > 4096) throw new Error('Capture override must contain 1–4096 characters');
     record.manifest.capture_override = redact(override).text;
@@ -316,18 +372,18 @@ export function prepareCommit(repo: Repo, task?: string, noActivity = false, ori
     for (const file of FILES) {
       if (!git(repo.root, ['ls-files', '--stage', '--', pathFor(tx.record_id, file)]).startsWith('100644 ') || hash(git(repo.root, ['show', `:${pathFor(tx.record_id, file)}`])) !== tx.files[file]) throw new Error('Git attributes transformed an archive file; use unchanged UTF-8 archive content');
     }
-    if (staged(repo).fingerprint !== record.manifest.staged_code_fingerprint) throw new Error('Staging changed during preparation');
+    if (staged(repo, base).fingerprint !== record.manifest.staged_code_fingerprint) throw new Error('Staging changed during preparation');
     tx.tree = git(repo.root, ['write-tree']).trim(); atomicWrite(transactionPath(repo), json(tx));
     return tx;
   } catch (error) { cleanFailed(repo, tx); throw error; }
 }
 
-export function commit(repo: Repo, message: string, task?: string, noActivity = false, override?: string) {
+export function commit(repo: Repo, message: string, task?: string, noActivity = false, override?: string, amend = false) {
   if (!message.trim() || message.includes('\0') || /^Reasoning-Record:/mi.test(message)) throw new Error('Provide a nonempty message without a Reasoning-Record trailer');
   if (process.env.GIT_INDEX_FILE) throw new Error('Controlled commits currently require the normal worktree index');
   return locked(repo, () => {
     if (existsSync(transactionPath(repo))) return recoverPending(repo); // Never retry a code commit before reconciliation.
-    const tx = prepareCommit(repo, task, noActivity, installedNative(repo)?.original_hooks, false, override);
+    const tx = prepareCommit(repo, task, noActivity, installedNative(repo)?.original_hooks, false, override, amend);
     try {
       const hooks = join(repo.stateDir, 'commit-hooks'); privateDirectory(hooks);
       const cli = fileURLToPath(new URL(import.meta.url.endsWith('.ts') ? './cli.ts' : './cli.js', import.meta.url));
@@ -339,7 +395,7 @@ export function commit(repo: Repo, message: string, task?: string, noActivity = 
       }
       const messagePath = join(repo.stateDir, 'commit-message');
       atomicWrite(messagePath, `${message.trimEnd()}\n\nReasoning-Record: ${tx.record_id}\n`);
-      const result = spawnSync('git', ['-c', `core.hooksPath=${hooks}`, 'commit', '--cleanup=verbatim', '-F', messagePath], {
+      const result = spawnSync('git', ['-c', `core.hooksPath=${hooks}`, 'commit', ...(amend ? ['--amend'] : []), '--cleanup=verbatim', '-F', messagePath], {
         cwd: repo.root, encoding: 'utf8', env: { ...process.env, REASONING_TRANSACTION: tx.record_id }, stdio: ['inherit', 'pipe', 'pipe'],
       });
       if (result.stdout) process.stderr.write(redact(result.stdout).text);

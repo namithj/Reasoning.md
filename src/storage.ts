@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync,
+import { closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync,
   realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { hostname, platform, release } from 'node:os';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
@@ -8,6 +8,8 @@ import { hash, json } from './schema.ts';
 
 export type Repo = { root: string; gitDir: string; commonDir: string; stateDir: string; commonState: string };
 export type Config = { schema_version: 1; repository_id: string; publication: 'private' | 'public'; mode: 'warn' | 'strict'; summarization: false };
+export type ProjectContext = { repo: Repo; workspaceRoot: string; discovery: 'ancestor' | 'descendant' | 'explicit' };
+export type WorkspaceBinding = { schema_version: 1; workspace_root: string; repository_root: string; discovery: ProjectContext['discovery'] };
 
 export function git(cwd: string, args: string[]): string {
   return gitBytes(cwd, args).toString('utf8');
@@ -32,6 +34,70 @@ export function repository(cwd = process.cwd()): Repo {
     throw new Error('Git metadata is inside the trackable worktree; move the Git directory outside it');
   }
   return { root, gitDir, commonDir, stateDir, commonState: join(commonDir, 'reasoning-recorder') };
+}
+
+const DISCOVERY_SKIP = new Set(['.git', '.hg', '.svn', 'node_modules', 'vendor']);
+// ponytail: Bound automatic scans in huge workspaces; --repo is the explicit upgrade path.
+const DISCOVERY_LIMIT = 4096;
+
+export function workspaceBinding(repo: Repo): WorkspaceBinding | null {
+  const path = join(repo.stateDir, 'workspace.json');
+  if (!existsSync(path)) return null;
+  const value = readJSON(path) as WorkspaceBinding;
+  if (value.schema_version !== 1 || !isAbsolute(value.workspace_root) || !isAbsolute(value.repository_root)
+    || !['ancestor', 'descendant', 'explicit'].includes(value.discovery)) throw new Error('Invalid workspace binding');
+  if (realpathSync(value.repository_root) !== repo.root) throw new Error('Workspace binding points to a different repository');
+  const root = realpathSync(value.workspace_root); const rel = relative(root, repo.root);
+  if (rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)) throw new Error('Workspace binding does not contain the repository');
+  return { ...value, workspace_root: root, repository_root: repo.root };
+}
+
+export function bindWorkspace(repo: Repo, workspaceRoot: string, discovery: ProjectContext['discovery']): WorkspaceBinding {
+  const root = realpathSync(workspaceRoot); const rel = relative(root, repo.root);
+  if (rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)) throw new Error('Workspace root must contain the selected repository');
+  const value: WorkspaceBinding = { schema_version: 1, workspace_root: root, repository_root: repo.root, discovery };
+  privateDirectory(repo.stateDir); atomicWrite(join(repo.stateDir, 'workspace.json'), json(value));
+  return value;
+}
+
+export function discoverProject(cwd = process.cwd(), selected?: string): ProjectContext {
+  const invocation = realpathSync(cwd);
+  if (selected) {
+    const repo = repository(resolve(invocation, selected)); const saved = workspaceBinding(repo);
+    return { repo, workspaceRoot: saved?.workspace_root ?? invocation, discovery: 'explicit' };
+  }
+  let current: Repo | null = null;
+  try { current = repository(invocation); } catch { /* Search below a non-Git workspace. */ }
+  if (current) {
+    const saved = workspaceBinding(current);
+    return { repo: current, workspaceRoot: saved?.workspace_root ?? current.root, discovery: saved?.discovery ?? 'ancestor' };
+  }
+
+  let level = [invocation]; let inspected = 0;
+  while (level.length) {
+    const next: string[] = []; const candidates = new Map<string, Repo>();
+    for (const parent of level) {
+      let entries;
+      try { entries = readdirSync(parent, { withFileTypes: true }); } catch { continue; }
+      for (const entry of entries) {
+        if (!entry.isDirectory() || entry.isSymbolicLink() || DISCOVERY_SKIP.has(entry.name)) continue;
+        if (++inspected > DISCOVERY_LIMIT) throw new Error('Git checkout discovery exceeded its safe directory limit; use --repo PATH');
+        const child = join(parent, entry.name); const marker = join(child, '.git');
+        let hasMarker = false;
+        try { const stat = lstatSync(marker); hasMarker = !stat.isSymbolicLink() && (stat.isDirectory() || stat.isFile()); } catch { /* Not a worktree root. */ }
+        if (hasMarker) {
+          try { const repo = repository(child); candidates.set(repo.root, repo); } catch { /* Ignore invalid Git markers. */ }
+        } else next.push(child);
+      }
+    }
+    if (candidates.size === 1) return { repo: [...candidates.values()][0], workspaceRoot: invocation, discovery: 'descendant' };
+    if (candidates.size > 1) {
+      const names = [...candidates.keys()].map(path => relative(invocation, path) || '.').sort().join(', ');
+      throw new Error(`Multiple Git checkouts found below this workspace: ${names}. Use --repo PATH`);
+    }
+    level = next;
+  }
+  throw new Error('No Git checkout found at or below the current workspace; run from a project or use --repo PATH');
 }
 
 export function assertPlain(path: string, directory: boolean) {

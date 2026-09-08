@@ -203,8 +203,8 @@ test('empty and replay-operation commits fail without preparing an archive', t =
   stage(); ok('commit', '-m', 'Initial');
   assert.match(run('commit', '-m', 'Empty').stderr, /No staged code/);
   stage('next');
-  writeFileSync(join(repo.gitDir, 'MERGE_HEAD'), git('rev-parse', 'HEAD'));
-  assert.match(run('commit', '-m', 'Merge').stderr, /not supported/);
+  mkdirSync(join(repo.gitDir, 'rebase-merge'));
+  assert.match(run('commit', '-m', 'Replay').stderr, /Finish the replay/);
   assert.equal(existsSync(join(repo.stateDir, 'transaction.json')), false);
 });
 
@@ -308,4 +308,213 @@ test('native hooks tolerate equivalent absolute path spellings', t => {
   state.directory += '/.'; // Git and Node may render the same absolute path differently.
   writeFileSync(installation, JSON.stringify(state));
   ok('hooks', 'install'); ok('hooks', 'uninstall');
+});
+
+test('amend creates a new record and retains earlier discussion, including a root amend', t => {
+  const { repo, git, ok, stage, cwd, hook } = setup(t);
+  stage(); ingest(repo, fixture); const first = ok('commit', '-m', 'First');
+  const original = git('show', `HEAD:.ai-history/records/${first.record_id}/manifest.json`);
+  hook('post-rewrite', 'cat >> rewrite-log');
+  stage('amended\n'); writeFileSync(join(cwd, 'code.txt'), 'unstaged\n');
+  const amended = ok('commit', '--amend', '-m', 'Amended root');
+  assert.equal(git('rev-list', '--count', 'HEAD').trim(), '1');
+  assert.notEqual(amended.record_id, first.record_id);
+  assert.equal(git('show', `HEAD:.ai-history/records/${first.record_id}/manifest.json`), original);
+  assert.equal(verify(repo).records.size, 2);
+  assert.equal(git('show', 'HEAD:code.txt'), 'amended\n');
+  assert.equal(readFileSync(join(cwd, 'code.txt'), 'utf8'), 'unstaged\n');
+  assert.match(readFileSync(join(cwd, 'rewrite-log'), 'utf8'), new RegExp(first.commit));
+  stage('second\n'); ok('commit', '-m', 'Second');
+  ok('commit', '--amend', '-m', 'Only message changed');
+  assert.equal(git('rev-list', '--count', 'HEAD').trim(), '2');
+  assert.equal(verify(repo).records.size, 4);
+});
+
+test('local merges preserve source records and verify against the first parent', t => {
+  const { repo, git, ok, stage, cwd } = setup(t);
+  stage(); ingest(repo, fixture); ok('commit', '-m', 'Base');
+  git('checkout', '-b', 'feature');
+  writeFileSync(join(cwd, 'feature.txt'), 'feature'); git('add', 'feature.txt');
+  const feature = ok('commit', '-m', 'Feature');
+  git('checkout', 'main'); stage('main\n'); ok('commit', '-m', 'Main');
+  git('merge', '--no-commit', '--no-ff', 'feature');
+  const merged = ok('commit', '-m', 'Merge feature');
+  assert.equal(git('show', '-s', '--format=%P', 'HEAD').trim().split(' ').length, 2);
+  assert.ok(verify(repo).records.has(feature.record_id));
+  assert.equal(verify(repo).record_id, merged.record_id);
+  ok('hooks', 'install');
+  git('checkout', 'feature'); writeFileSync(join(cwd, 'feature.txt'), 'next'); git('add', 'feature.txt'); git('commit', '-m', 'Next feature');
+  git('checkout', 'main'); assert.throws(() => git('merge', '--no-ff', 'feature', '-m', 'Native merge'), /Finish with reasoning commit/);
+  ok('commit', '-m', 'Finish staged merge');
+  assert.equal(verify(repo).capture_status, 'unavailable');
+});
+
+test('native full temporary index commits include archives and leave the index consistent', t => {
+  const { repo, git, ok, stage, cwd } = setup(t);
+  stage(); ok('commit', '-m', 'Base'); ok('hooks', 'install');
+  writeFileSync(join(cwd, 'code.txt'), 'all tracked edits\n');
+  writeFileSync(join(cwd, 'untracked.txt'), 'leave untracked');
+  git('commit', '-am', 'All tracked');
+  verify(repo);
+  assert.equal(git('diff', '--cached', '--name-only'), '');
+  assert.equal(git('show', 'HEAD:code.txt'), 'all tracked edits\n');
+  assert.equal(git('ls-files', 'untracked.txt'), '');
+  writeFileSync(join(cwd, 'code.txt'), 'path edit\n');
+  assert.throws(() => git('commit', '-m', 'Path limited', '--', 'code.txt'), /temporary index/);
+  assert.equal(existsSync(join(repo.stateDir, 'transaction.json')), false);
+});
+
+test('cherry-pick and rebase preserve record IDs without native injection', t => {
+  const { repo, git, ok, stage, cwd } = setup(t);
+  stage(); ok('commit', '-m', 'Base'); git('checkout', '-b', 'feature');
+  writeFileSync(join(cwd, 'feature.txt'), 'feature'); git('add', 'feature.txt');
+  const feature = ok('commit', '-m', 'Feature');
+  git('checkout', 'main'); stage('new base\n'); ok('commit', '-m', 'Main'); ok('hooks', 'install');
+  git('cherry-pick', feature.commit);
+  assert.equal(verify(repo).record_id, feature.record_id);
+  git('checkout', 'feature'); git('rebase', '--onto', 'main~1', 'feature~1');
+  assert.equal(verify(repo).record_id, feature.record_id);
+});
+
+test('squash retrieval survives dropped trailers while verification reports missing commit coverage', t => {
+  const { repo, git, ok, run, stage, cwd } = setup(t);
+  stage(); ingest(repo, fixture); ok('commit', '-m', 'Base'); git('checkout', '-b', 'feature');
+  stage('feature\n'); const feature = ok('commit', '-m', 'Feature');
+  git('checkout', 'main'); git('merge', '--squash', 'feature');
+  const squash = ok('commit', '-m', 'Controlled squash');
+  assert.ok(verify(repo).records.has(feature.record_id));
+  git('commit', '--amend', '-m', 'Platform squash without trailer');
+  const result = run('show', 'HEAD'); assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /coverage is unverified/); assert.match(result.stdout, new RegExp(squash.record_id));
+  assert.notEqual(run('verify', 'HEAD').status, 0);
+});
+
+test('failed amend and failed temporary-index commit retain discussion and user staging', t => {
+  const { repo, git, ok, run, stage, cwd, hook, hooks } = setup(t);
+  stage(); ingest(repo, fixture); const first = ok('commit', '-m', 'Base');
+  stage('amended\n'); const before = git('ls-files', '--stage');
+  hook('commit-msg', 'exit 1');
+  assert.notEqual(run('commit', '--amend', '-m', 'Reject amend').status, 0);
+  assert.equal(git('rev-parse', 'HEAD').trim(), first.commit);
+  assert.equal(git('ls-files', '--stage'), before);
+  ok('hooks', 'install'); writeFileSync(join(cwd, 'code.txt'), 'all edits\n');
+  assert.throws(() => git('commit', '-am', 'Reject -a'), /failed/);
+  assert.equal(git('ls-files', '--stage'), before);
+  assert.equal(readFileSync(join(cwd, 'code.txt'), 'utf8'), 'all edits\n');
+  assert.equal(existsSync(join(repo.stateDir, 'transaction.json')), false);
+  rmSync(join(hooks, 'commit-msg'));
+  git('commit', '-am', 'Retry -a'); verify(repo);
+});
+
+test('revert workflow preserves archives and records conflict-resolution follow-up without code changes', t => {
+  const { repo, git, ok, stage } = setup(t);
+  stage(); ingest(repo, fixture); const base = ok('commit', '-m', 'Base');
+  stage('feature\n'); const feature = ok('commit', '-m', 'Feature');
+  git('revert', '--no-commit', feature.commit);
+  git('restore', '--source=HEAD', '--staged', '--worktree', '--', '.ai-history/records');
+  const reverted = ok('commit', '-m', 'Revert feature and retain its history');
+  assert.equal(git('show', 'HEAD:code.txt'), 'staged\n');
+  assert.ok(verify(repo).records.has(feature.record_id));
+  const event = JSON.parse(fixture.split('\n')[0]); event.sequence = 4; event.source.event_id = 'resolution'; event.type = 'explicit_decision'; event.content = 'Resolved conflict using current API; keep earlier record as context.';
+  ingest(repo, JSON.stringify(event) + '\n');
+  const resolution = ok('commit', '-m', 'Record conflict resolution discussion');
+  assert.equal(verify(repo).records.get(resolution.record_id).manifest.staged_code_paths.length, 0);
+  assert.equal(git('rev-list', '--count', `${reverted.commit}..HEAD`).trim(), '1');
+  assert.ok(verify(repo).records.has(base.record_id));
+});
+
+test('fresh clone lists archived tasks and binds a new host session to saved context', t => {
+  const { repo, git, ok, stage, dir } = setup(t);
+  stage(); const task = ok('task', 'start', 'Continue this task on another machine');
+  ok('decision', 'Keep the public API stable'); ok('commit', '-m', 'Save task');
+  const clone = join(dir, 'fresh'); git('clone', repo.root, clone);
+  const run = (...args) => { const result = spawnSync(process.execPath, [cli, ...args], { cwd: clone, encoding: 'utf8' }); assert.equal(result.status, 0, result.stderr); return JSON.parse(result.stdout); };
+  assert.ok(run('task', 'list').tasks[task.task_id]);
+  run('init', '--publication', 'private');
+  run('task', 'bind', 'codex', 'new-session', '--task', task.task_id);
+  assert.equal(run('task', 'list').bindings['["codex","new-session"]'], task.task_id);
+});
+
+test('merge does not export source-branch events a second time', t => {
+  const { repo, git, ok, stage, cwd } = setup(t);
+  stage(); ingest(repo, fixture); ok('commit', '-m', 'Base'); git('checkout', '-b', 'feature');
+  const event = JSON.parse(fixture.split('\n')[0]); event.sequence = 4; event.source.event_id = 'branch-decision'; event.type = 'explicit_decision'; event.content = 'Use the branch implementation';
+  ingest(repo, JSON.stringify(event) + '\n');
+  writeFileSync(join(cwd, 'feature.txt'), 'feature'); git('add', 'feature.txt'); const source = ok('commit', '-m', 'Feature');
+  git('checkout', 'main'); git('merge', '--no-ff', '--no-commit', 'feature');
+  const preview = commitPreview(repo); assert.equal(preview.manifest.capture_boundary.event_ids.length, 0); assert.ok(preview.manifest.referenced_records.includes(source.record_id));
+  const merged = ok('commit', '-m', 'Merge'); const record = verify(repo).records.get(merged.record_id);
+  assert.equal(record.manifest.capture_boundary.event_ids.length, 0);
+  assert.ok(record.manifest.referenced_records.includes(source.record_id));
+});
+
+test('uninstall refuses a pending transaction in another linked worktree', t => {
+  const { repo, git, ok, run, stage, dir } = setup(t);
+  stage(); ok('commit', '-m', 'Base'); ok('hooks', 'install');
+  const sibling = join(dir, 'sibling'); git('worktree', 'add', '-b', 'sibling', sibling);
+  const other = repository(sibling); mkdirSync(other.stateDir, { recursive: true }); writeFileSync(join(other.stateDir, 'transaction.json'), '{}');
+  assert.match(run('hooks', 'uninstall').stderr, /every worktree/);
+  assert.ok(git('config', 'core.hooksPath').includes('native-hooks'));
+  rmSync(join(other.stateDir, 'transaction.json')); ok('hooks', 'uninstall');
+});
+
+test('amend preview uses the same root/parent boundary and retained records as the resulting commit', t => {
+  const { repo, stage, ok, run, git } = setup(t);
+  stage(); ingest(repo, fixture); const first = ok('commit', '-m', 'First');
+  stage('amend preview\n');
+  let preview = run('preview', '--staged', '--amend'); assert.equal(preview.status, 0, preview.stderr);
+  assert.match(preview.stdout, new RegExp(first.record_id)); assert.match(preview.stdout, /code.txt/);
+  const amended = ok('commit', '--amend', '-m', 'Amended');
+  assert.equal(verify(repo).records.get(amended.record_id).manifest.capture_boundary.event_ids.length, 0);
+  stage('next\n'); ok('commit', '-m', 'Next');
+  preview = run('preview', '--staged', '--amend'); assert.equal(preview.status, 0, preview.stderr);
+  assert.match(preview.stdout, /code.txt/);
+  assert.equal(git('diff', '--cached', '--name-only'), '');
+});
+
+test('search, handoff and file explanation retrieve archives removed by later commits', t => {
+  const { repo, cwd, git, ok, stage, dir } = setup(t);
+  stage(); const task = ok('task', 'start', 'Retain deleted archive evidence');
+  ok('decision', 'Use the original public contract'); const saved = ok('commit', '-m', 'Save evidence');
+  git('rm', '-r', '.ai-history'); git('commit', '-m', 'External removal');
+  const clone = join(dir, 'history clone'); git('clone', cwd, clone);
+  const run = (...args) => { const result = spawnSync(process.execPath, [cli, ...args], { cwd: clone, encoding: 'utf8' }); assert.equal(result.status, 0, result.stderr); return JSON.parse(result.stdout); };
+  assert.ok(run('task', 'list').tasks[task.task_id]);
+  const matches = run('search', 'original public contract').matches;
+  assert.equal(matches.length, 1); assert.equal(matches[0].commit, saved.commit);
+  assert.equal(matches[0].record_id, saved.record_id);
+  assert.match(run('context', '--task', task.task_id, '--format', 'json').text, new RegExp(saved.commit));
+  const explanation = run('explain', '--file', 'code.txt');
+  assert.equal(explanation.records[0].commit, saved.commit);
+  assert.match(explanation.records[0].text, /original public contract/);
+  git('restore', `--source=${saved.commit}`, '--staged', '--worktree', '--', '.ai-history');
+  writeFileSync(join(cwd, `.ai-history/records/${saved.record_id}/reasoning.txt`), 'tampered');
+  git('add', '.ai-history'); git('commit', '-m', 'Corrupted restoration');
+  const failure = spawnSync(process.execPath, [cli, 'search', 'original public contract'], { cwd, encoding: 'utf8' });
+  assert.notEqual(failure.status, 0); assert.match(failure.stderr, /hash mismatch/);
+  git('rm', `.ai-history/records/${saved.record_id}/manifest.json`); git('commit', '-m', 'Partial archive removal');
+  const partial = spawnSync(process.execPath, [cli, 'search', 'original public contract'], { cwd, encoding: 'utf8' });
+  assert.notEqual(partial.status, 0); assert.match(partial.stderr, /manifest/);
+});
+
+test('resuming an archived task activates new captures and decisions without duplicating the objective', t => {
+  const { repo, cwd, git, ok, stage, dir } = setup(t);
+  stage(); const task = ok('task', 'start', 'Resume this objective');
+  ok('decision', 'First decision'); const first = ok('commit', '-m', 'First');
+  const clone = join(dir, 'resume clone'); git('clone', cwd, clone);
+  const run = (...args) => { const result = spawnSync(process.execPath, [cli, ...args], { cwd: clone, encoding: 'utf8' }); assert.equal(result.status, 0, result.stderr); return JSON.parse(result.stdout); };
+  execFileSync('git', ['config', 'user.name', 'Resume Test'], { cwd: clone }); execFileSync('git', ['config', 'user.email', 'test@example.invalid'], { cwd: clone });
+  run('init', '--publication', 'private'); run('task', 'resume', task.task_id);
+  assert.equal(run('task', 'list').active, task.task_id);
+  assert.match(run('preview', '--staged', '--format', 'json').text, new RegExp(first.record_id));
+  run('decision', 'Second decision from another machine');
+  run('adapter', 'enable', 'codex', '--surface', 'import', '--parser', 'none');
+  const input = join(clone, 'hook.json'); writeFileSync(input, JSON.stringify({ hook_event_name: 'UserPromptSubmit', session_id: 'new-chat', cwd: clone, prompt: 'Continue the saved objective' }));
+  assert.equal(run('capture', 'codex', '--input', input, '--delivery-id', 'new-prompt').task_id, task.task_id);
+  const committed = run('commit', '-m', 'Continue saved task');
+  const record = verify(repository(clone)).records.get(committed.record_id);
+  assert.ok(record.manifest.referenced_records.includes(first.record_id));
+  const events = record.eventData.trim().split('\n').map(JSON.parse);
+  assert.equal(events.filter(event => event.source.locator === 'task:start').length, 0);
+  assert.equal(events.find(event => event.type === 'explicit_decision').sequence, 1);
 });

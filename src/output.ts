@@ -32,8 +32,10 @@ export function formatOutput(command: string, value: any, format: OutputFormat =
   let data = value;
   switch (command) {
     case 'init':
-      summary = 'Project initialized for conversation records.';
-      next = 'Configure your assistant:\n  reasoning adapter enable claude-code\n  or: reasoning adapter enable codex\nThen inspect setup with reasoning doctor. Initialization alone does not enable capture. On Windows, use explicit transcript imports instead of automatic adapter setup.';
+      summary = value.workspace?.discovery === 'descendant'
+        ? `Project initialized in nested Git worktree ${value.workspace.repository_root}.`
+        : 'Project initialized for conversation records.';
+      next = `${value.reconfigured_adapters?.length ? 'Existing assistant hooks were updated for this workspace. Reload the assistant and review the changed hooks.\n' : ''}Configure your assistant:\n  reasoning adapter enable claude-code\n  or: reasoning adapter enable codex\nThen inspect setup with reasoning doctor. Initialization alone does not enable new capture adapters. Windows setup supports claude-code and copilot-cli; use transcript imports for other Windows hosts.`;
       break;
     case 'doctor': {
       const installations = value.capture?.installations ?? {};
@@ -41,14 +43,16 @@ export function formatOutput(command: string, value: any, format: OutputFormat =
       summary = value.initialized ? 'Project initialized. Review the setup and capture checks below.' : 'This project has not been initialized.';
       data = {
         initialized: value.initialized,
+        current_installation_health: value.health ?? null,
         capture_status: value.recorder ? coverage(value.recorder.capture_status) : 'Initialize the project first',
         saved_events: value.recorder?.events ?? 0,
         queued_deliveries: value.recorder?.queued_capture_deliveries ?? 0,
         pending_transaction: value.recorder?.pending_transaction ?? false,
         lock_present: value.recorder?.lock_present ?? false,
         publication: value.recorder?.publication ?? null,
+        workspace: value.workspace ?? null,
         commit_integration: value.recorder?.commit_integration === 'controlled_wrapper' ? 'Use reasoning commit to attach records' : value.recorder?.commit_integration ? 'Native hooks configured; editor compatibility unverified' : null,
-        adapters: Object.fromEntries(Object.entries(installations).map(([host, setup]: [string, any]) => [host, { parser: setup.parser, surface: setup.surface, config_path: setup.config_path }])),
+        adapters: Object.fromEntries(Object.entries(installations).map(([host, setup]: [string, any]) => [host, { parser: setup.parser, surface: setup.surface, config_root: setup.config_root ?? null, config_path: setup.config_path }])),
         capture_sessions: sessions.map(session => ({ session_id: session.session, host: session.host, task_id: session.task, gaps: session.gaps })),
         active_task: value.tasks?.active ?? null,
         environment: value.hosts?.[0]?.environment ? { platform: value.hosts[0].environment.platform, architecture: value.hosts[0].environment.architecture, container: value.hosts[0].environment.container, ssh: value.hosts[0].environment.ssh, wsl: value.hosts[0].environment.wsl } : null,
@@ -136,6 +140,10 @@ export function formatOutput(command: string, value: any, format: OutputFormat =
     case 'task start':
       summary = 'Task created and selected for new sessions.';
       next = `Use --task ${value.task_id} when selecting this task for a preview, commit or context handoff.`;
+      break;
+    case 'task resume':
+      summary = `Task ${value.task_id} is active for new sessions.`;
+      next = 'Load saved evidence with reasoning context --task ' + value.task_id + '. Existing session bindings are preserved.';
       break;
     case 'task list':
       summary = Object.keys(value.tasks).length ? `${Object.keys(value.tasks).length} local tasks. Use their IDs to select context or commit history.` : 'No local tasks yet.';

@@ -16,6 +16,7 @@
     "docs/adapters.md",
     "docs/controlled-commits.md",
     "docs/event-format.md",
+    "docs/implementation-status.md",
     "LICENSE"
   ],
   "scripts": {

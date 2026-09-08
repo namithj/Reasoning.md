@@ -87,3 +87,5 @@ Stored events include additional repository, worktree, environment and redaction
 Each record contains readable text, events and a manifest describing its event boundary, gaps, file hashes and association with staged code. Controlled commit records can reference earlier records for the same task. Standalone exports are snapshots with no commit association.
 
 Assistant capture and imports are currently `partial`. Empty history is `unavailable`. Only an explicit commit-time attestation can produce `no_assistant_activity`; it is never inferred from an empty import. Parser/version metadata and coverage overrides do not certify complete capture.
+
+Commit manifests can additionally contain `code_base` (the base commit or empty-tree object used when preparing an amend) and `preserved_records` (record IDs mapped to SHA-256 hashes of unchanged source manifests). Verification compares the actual containing commit to its first parent, validates every preserved record's files and references, and rejects archive deletion or modification. Earlier manifests without these optional fields remain readable.

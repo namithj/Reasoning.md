@@ -74,6 +74,8 @@ test('Codex rollout ignores hidden reasoning and duplicate event_msg summaries',
   const source = [
     { type: 'session_meta', payload: { id: 's1', cwd } },
     { type: 'event_msg', payload: { type: 'agent_message', message: 'duplicate' } },
+    { type: 'token_usage_record', payload: { total_token_usage: { input_tokens: 1 } } },
+    { type: 'world_state', payload: { internal: 'HIDDEN' } },
     { type: 'response_item', payload: { type: 'reasoning', content: 'HIDDEN' } },
     { type: 'response_item', payload: { type: 'message', role: 'assistant', channel: 'analysis', content: [{ type: 'output_text', text: 'HIDDEN' }] } },
     { type: 'response_item', payload: { type: 'message', role: 'assistant', channel: 'final', content: [{ type: 'output_text', text: 'Visible response' }] } },
@@ -166,4 +168,87 @@ test('binding an already captured session cannot silently move its history', t =
   capture(repo, 'codex', { hook_event_name: 'UserPromptSubmit', session_id: 'bound', cwd, prompt: 'Original task' }, 'bound');
   const next = startTask(repo, 'Different task');
   assert.throws(() => bindTask(repo, 'codex', 'bound', next.task_id), /already belongs/);
+});
+
+test('Copilot VS Code v1 reuses the parser, captures replayed tool requests once and omits reasoning', t => {
+  const { repo, cwd } = setup(t); enableAdapter(repo, 'copilot-vscode');
+  const source = [
+    { id: 'start', type: 'session.start', data: { version: 1, sessionId: 'vscode-session', producer: 'copilot-agent', vscodeVersion: '1.110.0', copilotVersion: '0.38.0' } },
+    { id: 'u', type: 'user.message', data: { content: 'Read greeting' } },
+    { id: 'a', type: 'assistant.message', data: { content: 'Full visible reply', reasoningText: 'HIDDEN', toolRequests: [{ toolCallId: 'call1', name: 'Read', arguments: '{"file":"greeting"}' }] } },
+    { id: 'call', type: 'tool.execution_start', data: { toolCallId: 'call1', toolName: 'Read', arguments: { file: 'greeting' } } },
+    { id: 'result', type: 'tool.execution_complete', data: { toolCallId: 'call1', result: { content: 'password=secret-value' } } },
+  ];
+  const path = join(cwd, 'vscode.jsonl'); writeFileSync(path, jsonl(source));
+  const payload = { hook_event_name: 'Stop', session_id: 'vscode-session', cwd, transcript_path: path };
+  capture(repo, 'copilot-vscode', payload, 'stop'); capture(repo, 'copilot-vscode', payload, 'stop');
+  const events = journal(repo).filter(event => event.source.tool === 'copilot');
+  for (const type of ['user_message', 'assistant_message', 'tool_call', 'tool_result']) assert.equal(events.filter(e => e.type === type).length, 1);
+  assert.doesNotMatch(JSON.stringify(events), /HIDDEN|secret-value/);
+  assert.ok(events.some(e => e.type === 'capture_gap' && e.content.includes('repository association')));
+  source[0].data.version = 2;
+  assert.throws(() => parseTranscript('copilot-vscode', 'copilot-events-v1', jsonl(source), 'vscode-session', cwd), /version/);
+});
+
+test('reconcile retries a source whose first flush happens after the last hook', async t => {
+  const { reconcile } = await import('../src/adapters.ts');
+  const { repo, cwd } = setup(t); enableAdapter(repo, 'claude-code');
+  const path = join(cwd, 'delayed.jsonl');
+  capture(repo, 'claude-code', { hook_event_name: 'Stop', session_id: 'late', cwd, transcript_path: path }, 'last-hook');
+  assert.equal(captureState(repo).sessions['["claude-code","late"]'].transcript, path);
+  writeFileSync(path, jsonl(rows('late', cwd)));
+  reconcile(repo); reconcile(repo);
+  assert.equal(journal(repo).filter(e => e.source.session_id === 'late' && e.type === 'assistant_message').length, 1);
+});
+
+test('doctor health detects removed hook commands instead of trusting installation state', { skip: process.platform === 'win32' }, async t => {
+  const { health } = await import('../src/probe.ts');
+  const { repo, cwd } = setup(t); enableAdapter(repo, 'codex');
+  assert.equal(health(repo).adapters.codex.hook_commands_present, true);
+  const path = join(cwd, '.codex/hooks.json'); const configuration = JSON.parse(readFileSync(path, 'utf8'));
+  configuration.hooks.Stop = []; writeFileSync(path, JSON.stringify(configuration));
+  assert.equal(health(repo).adapters.codex.hook_commands_present, false);
+  assert.equal(health(repo).adapters.codex.live_panel_verified, false);
+});
+
+test('Claude and Copilot CLI launch capture directly and preserve unrelated Node hooks', t => {
+  for (const host of ['claude-code', 'copilot-cli']) {
+    const { repo, cwd } = setup(t);
+    enable(repo, host);
+    const spec = captureState(repo).installations[host];
+    const path = join(cwd, spec.config_path);
+    const configuration = JSON.parse(readFileSync(path, 'utf8'));
+    const wrapper = configuration.hooks.UserPromptSubmit[0];
+    const entry = host === 'claude-code' ? wrapper.hooks[0] : wrapper;
+    assert.equal(entry.command ?? entry.exec, process.execPath);
+    assert.ok(Array.isArray(entry.args));
+    const sibling = { type: 'command', command: process.execPath, args: ['unrelated-script.js'] };
+    if (host === 'claude-code') wrapper.hooks.push(sibling);
+    else configuration.hooks.UserPromptSubmit.push(sibling);
+    writeFileSync(path, JSON.stringify(configuration));
+    enable(repo, host); enable(repo, host);
+    const rewritten = JSON.parse(readFileSync(path, 'utf8')).hooks.UserPromptSubmit;
+    const flattened = rewritten.flatMap(item => item.hooks ?? [item]);
+    assert.equal(flattened.filter(item => item.args?.includes('unrelated-script.js')).length, 1);
+    assert.equal(flattened.filter(item => item.args?.includes('capture')).length, 1);
+    const result = spawnSync(entry.command ?? entry.exec, entry.args, { cwd, input: JSON.stringify({ hook_event_name: 'UserPromptSubmit', session_id: 'direct', cwd, prompt: 'Literal $HOME and `text` remain text', timestamp: stamp }), encoding: 'utf8' });
+    assert.equal(result.status, 0, result.stderr); assert.equal(result.stdout, '');
+    assert.equal(journal(repo).find(event => event.source.session_id === 'direct').content, 'Literal $HOME and `text` remain text');
+  }
+});
+
+test('capture preserves exposed source model identity and handles Codex model switches', t => {
+  const { repo, cwd } = setup(t); enableAdapter(repo, 'codex', { surface: 'import' });
+  const path = join(cwd, 'models.jsonl');
+  writeFileSync(path, jsonl([
+    { type: 'session_meta', payload: { id: 'models', cwd } },
+    { type: 'turn_context', payload: { model: 'model-one' } },
+    { type: 'response_item', payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'First reply' }] } },
+    { type: 'turn_context', payload: { model: 'model-two' } },
+    { type: 'response_item', payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Second reply' }] } },
+  ]));
+  capture(repo, 'codex', { hook_event_name: 'Reconcile', session_id: 'models', cwd, transcript_path: path }, 'models');
+  assert.deepEqual(journal(repo).filter(event => event.type === 'assistant_message').map(event => event.model), ['model-one', 'model-two']);
+  const claude = rows('claude-model', cwd); claude[1].message.model = 'claude-exposed-model';
+  assert.equal(parseTranscript('claude-code', 'claude-jsonl-v1', jsonl(claude), 'claude-model', cwd).find(event => event.type === 'assistant_message').model, 'claude-exposed-model');
 });
