@@ -104,15 +104,15 @@ export function staged(repo: Repo, base?: string) {
   return { paths: changed, fingerprint: hash(diff) };
 }
 
-export function snapshot(repo: Repo, task?: string, options: { commit?: boolean; excludeIds?: Set<string>; references?: string[]; noActivity?: boolean; base?: string } = {}) {
+export function snapshot(repo: Repo, task?: string, options: { commit?: boolean; excludeIds?: Set<string>; references?: string[]; noActivity?: boolean; base?: string; allowEmptyTask?: boolean } = {}) {
   const policy = config(repo);
   const all = journal(repo);
-  if (!task && new Set(all.map(e => e.task_id)).size > 1) throw new Error('Multiple tasks are present; choose --task explicitly');
-  let events = task ? all.filter(e => e.task_id === task) : all;
-  if (task && !events.length && !options.references?.length) throw new Error('No imported events match this task');
-  const selectedTask = task ?? events[0]?.task_id ?? null;
-  events = events.filter(event => !options.excludeIds?.has(event.event_id));
-  if (options.noActivity && events.length) throw new Error('Cannot attest no assistant activity while selected events are pending');
+  const pending = all.filter(event => !options.excludeIds?.has(event.event_id));
+  if (!task && new Set(pending.map(e => e.task_id)).size > 1) throw new Error('Multiple tasks are present; choose --task explicitly');
+  const selectedTask = task ?? pending[0]?.task_id ?? null;
+  let events = selectedTask ? pending.filter(event => event.task_id === selectedTask) : pending;
+  if (task && !events.length && !options.references?.length && !options.allowEmptyTask) throw new Error('No imported events match this task');
+  if (options.noActivity && pending.length) throw new Error('Cannot attest no assistant activity while pending events are captured');
   const captureStatus = options.noActivity ? 'no_assistant_activity' : events.length ? 'partial' : 'unavailable';
   // Scan again before any export. Historical text is evidence, never executable instructions.
   events = events.map(event => {
@@ -129,6 +129,8 @@ export function snapshot(repo: Repo, task?: string, options: { commit?: boolean;
   const omissions = ['Host-panel completeness is unverified. Only observable captured and imported events are present.',
     'Events are ordered within each session; no total chronological order across sessions is claimed.',
     options.commit ? 'Only captured and imported events at this frozen boundary are included. Host-panel completeness remains unverified.' : 'This is a snapshot, not a finalized commit record. Export does not consume journal events.'];
+  const outsideSelected = selectedTask ? pending.filter(event => event.task_id !== selectedTask) : [];
+  if (outsideSelected.length) omissions.push(`${outsideSelected.length} pending event${outsideSelected.length === 1 ? '' : 's'} from ${new Set(outsideSelected.map(event => event.task_id)).size} other task${new Set(outsideSelected.map(event => event.task_id)).size === 1 ? '' : 's'} are omitted from this selected-task record.`);
   const sourceSessions = sessions.map(key => {
     const selected = events.filter(e => sourceKey(e) === key);
     const sequences = selected.map(e => e.sequence);

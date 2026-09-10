@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { initialize, repository } from '../src/storage.ts';
 import { ingest, journal } from '../src/recorder.ts';
 import { commitPreview, verify } from '../src/commits.ts';
+import { decision, ensureDefaultTask, startTask } from '../src/history.ts';
 
 const cli = fileURLToPath(new URL('../src/cli.ts', import.meta.url));
 const fixture = readFileSync(new URL('fixtures/conversation.jsonl', import.meta.url), 'utf8');
@@ -131,6 +132,45 @@ test('manual no-activity status requires explicit attestation and rejects pendin
 test('no activity is never inferred from an empty journal', t => {
   const { stage, ok } = setup(t); stage();
   assert.equal(ok('commit', '-m', 'Unknown coverage').capture_status, 'unavailable');
+});
+
+test('an active empty default task permits an ordinary code-only commit with unavailable capture', t => {
+  const { repo, stage, ok } = setup(t); const task = ensureDefaultTask(repo);
+  assert.equal(ensureDefaultTask(repo).task_id, task.task_id);
+  assert.equal(journal(repo).length, 0);
+  stage(); const committed = ok('commit', '-m', 'Code only');
+  const record = verify(repo).records.get(committed.record_id);
+  assert.equal(record.manifest.task_id, task.task_id);
+  assert.equal(record.manifest.capture_status, 'unavailable');
+  assert.equal(record.manifest.capture_boundary.event_ids.length, 0);
+});
+
+test('pending task selection ignores archived task IDs and references the selected task', t => {
+  const { repo, stage, ok } = setup(t);
+  const firstTask = startTask(repo, 'Archived task'); decision(repo, 'Archived decision'); stage('first\n'); ok('commit', '-m', 'First task');
+  const selectedTask = startTask(repo, 'Selected task'); decision(repo, 'Selected decision'); stage('second\n'); const selected = ok('commit', '-m', 'Selected task');
+  decision(repo, 'Pending selected decision');
+  const state = JSON.parse(readFileSync(join(repo.stateDir, 'tasks.json'), 'utf8')); state.active = null; writeFileSync(join(repo.stateDir, 'tasks.json'), JSON.stringify(state));
+  stage('third\n'); const preview = commitPreview(repo);
+  assert.equal(preview.manifest.task_id, selectedTask.task_id);
+  assert.deepEqual(preview.manifest.referenced_records, [selected.record_id]);
+  assert.match(preview.reasoning, /Pending selected decision/);
+  assert.doesNotMatch(preview.reasoning, /Archived decision/);
+  assert.notEqual(firstTask.task_id, selectedTask.task_id);
+});
+
+test('explicit task selection isolates other pending tasks while unselected ambiguity still fails', t => {
+  const { repo, stage } = setup(t);
+  const first = startTask(repo, 'First pending task'); decision(repo, 'First pending decision');
+  const second = startTask(repo, 'Second pending task'); decision(repo, 'Second pending decision');
+  const state = JSON.parse(readFileSync(join(repo.stateDir, 'tasks.json'), 'utf8')); state.active = null; writeFileSync(join(repo.stateDir, 'tasks.json'), JSON.stringify(state));
+  stage(); assert.throws(() => commitPreview(repo), /Multiple tasks/);
+  const selected = commitPreview(repo, first.task_id);
+  assert.equal(selected.manifest.task_id, first.task_id);
+  assert.equal(selected.manifest.capture_boundary.event_ids.length, 2);
+  assert.match(selected.reasoning, /2 pending events from 1 other task are omitted/);
+  assert.doesNotMatch(selected.reasoning, /Second pending decision/);
+  assert.notEqual(first.task_id, second.task_id);
 });
 
 test('staged archive edits and unsupported commit forms are rejected', t => {

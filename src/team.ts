@@ -15,7 +15,7 @@ export function setPolicy(repo: Repo, mode: string) {
   });
 }
 
-export function installSkill(repo: Repo, host: string) {
+export function installSkill(repo: Repo, host: string, preserveCustomized = false) {
   const locations: Record<string, string> = { codex: '.agents/skills', 'claude-code': '.claude/skills', 'copilot-vscode': '.github/skills', 'copilot-cli': '.github/skills' };
   if (!Object.hasOwn(locations, host)) throw new Error('Unknown companion skill host');
   const source = readFileSync(fileURLToPath(new URL('../skills/reasoning-md/SKILL.md', import.meta.url)), 'utf8');
@@ -23,7 +23,14 @@ export function installSkill(repo: Repo, host: string) {
     let parent = repo.root;
     for (const part of [...locations[host].split('/'), 'reasoning-md']) { parent = join(parent, part); privateDirectory(parent); }
     const path = join(parent, 'SKILL.md'); assertPlain(path, false);
-    if (existsSync(path) && readFileSync(path, 'utf8') !== source) throw new Error('Existing companion skill differs; review it before replacing it');
+    if (existsSync(path) && readFileSync(path, 'utf8') !== source) {
+      if (!preserveCustomized) throw new Error('Existing companion skill differs; review it before replacing it');
+      return {
+        installed: false, preserved: true, host, path,
+        warning: 'Existing customized companion skill was preserved; review it against the packaged Reasoning.md skill.',
+        host_discovery_gate: 'not_tested_by_file_installation',
+      };
+    }
     atomicWrite(path, source);
     return { installed: true, host, path, host_discovery_gate: 'not_tested_by_file_installation' };
   });

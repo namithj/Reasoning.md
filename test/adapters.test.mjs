@@ -36,6 +36,28 @@ test('Claude reconciliation saves prompt/reply/tools once and never saves thinki
   assert.ok(!JSON.stringify(events).includes('HIDDEN-DO-NOT-CAPTURE'));
 });
 
+test('Claude 2.1.267 metadata rows are accepted while attachments remain explicit gaps', t => {
+  const { cwd } = setup(t); const session = 'claude-structural';
+  const source = [
+    { type: 'custom-title', customTitle: 'Test title', sessionId: session },
+    { type: 'agent-name', agentName: 'Test agent', sessionId: session },
+    { type: 'attachment', uuid: 'attachment-1', sessionId: session, cwd, timestamp: stamp,
+      attachment: { type: 'text', text: 'VISIBLE-ATTACHMENT-CONTEXT' } },
+    { type: 'atis-latch', atis: 'metadata', sessionId: session },
+    ...rows(session, cwd),
+  ];
+  const parsed = parseTranscript('claude-code', 'claude-jsonl-v1', jsonl(source), session, cwd);
+  assert.deepEqual(parsed.filter(event => event.type === 'capture_gap').map(event => event.content),
+    ['Claude transcript attachment omitted; its visible context or hook output was not imported.']);
+  assert.ok(parsed.some(event => event.type === 'user_message'));
+  assert.ok(parsed.some(event => event.type === 'assistant_message'));
+  assert.ok(parsed.some(event => event.type === 'tool_call'));
+  assert.ok(parsed.some(event => event.type === 'tool_result'));
+  assert.doesNotMatch(JSON.stringify(parsed), /VISIBLE-ATTACHMENT-CONTEXT/);
+  assert.throws(() => parseTranscript('claude-code', 'claude-jsonl-v1', jsonl([...source,
+    { type: 'unknown-2.1.267-row', sessionId: session }]), session, cwd), /Unsupported Claude transcript row type/);
+});
+
 test('late transcript flush reconciles provisional prompts without losing repeated prompts', t => {
   const { repo, cwd } = setup(t); enableAdapter(repo, 'claude-code');
   capture(repo, 'claude-code', { hook_event_name: 'UserPromptSubmit', session_id: 's1', cwd, prompt: 'Hello recorder' }, 'delivery1');
@@ -45,6 +67,18 @@ test('late transcript flush reconciles provisional prompts without losing repeat
   const payload = { hook_event_name: 'Stop', session_id: 's1', cwd, transcript_path: path };
   capture(repo, 'claude-code', payload, 'stop'); capture(repo, 'claude-code', payload, 'stop');
   assert.equal(journal(repo).filter(e => e.type === 'user_message').length, 2);
+});
+
+test('a delayed timestamp-less hook does not duplicate a transcript reply', t => {
+  const { repo, cwd } = setup(t); enableAdapter(repo, 'codex');
+  const path = join(cwd, 'rollout.jsonl');
+  writeFileSync(path, jsonl([
+    { type: 'session_meta', payload: { id: 'late-hook', cwd } },
+    { type: 'response_item', timestamp: stamp, payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Already imported reply' }] } },
+  ]));
+  capture(repo, 'codex', { hook_event_name: 'SessionStart', session_id: 'late-hook', cwd, transcript_path: path }, 'start');
+  capture(repo, 'codex', { hook_event_name: 'Stop', session_id: 'late-hook', cwd, last_assistant_message: 'Already imported reply' }, 'late-stop');
+  assert.equal(journal(repo).filter(event => event.source.session_id === 'late-hook' && event.type === 'assistant_message').length, 1);
 });
 
 test('capture batch replay remains redacted and preserves redaction metadata', t => {
@@ -128,6 +162,22 @@ test('busy recorder queues redacted input and reconciles it once', async t => {
   reconcile(repo); reconcile(repo);
   assert.equal(journal(repo).filter(e => e.source.session_id === 'queue-session' && e.type === 'user_message').length, 1);
   assert.equal(readdirSync(directory).length, 0);
+});
+
+test('SessionStart recovers queued delivery and delayed known transcript exactly once', async t => {
+  const { repo, cwd } = setup(t); enableAdapter(repo, 'claude-code');
+  const delayed = join(cwd, 'delayed-on-start.jsonl');
+  capture(repo, 'claude-code', { hook_event_name: 'Stop', session_id: 'late', cwd, transcript_path: delayed }, 'late-stop');
+  const { locked } = await import('../src/storage.ts');
+  locked(repo, () => assert.equal(capture(repo, 'claude-code', { hook_event_name: 'UserPromptSubmit', session_id: 'queued', cwd, prompt: 'Recover this queued prompt' }, 'queued-prompt').queued, true));
+  writeFileSync(delayed, jsonl(rows('late', cwd)));
+  capture(repo, 'claude-code', { hook_event_name: 'SessionStart', session_id: 'new-session', cwd }, 'new-start');
+  capture(repo, 'claude-code', { hook_event_name: 'SessionStart', session_id: 'new-session', cwd }, 'new-start');
+  const events = journal(repo);
+  assert.equal(events.filter(event => event.source.session_id === 'late' && event.type === 'assistant_message').length, 1);
+  assert.equal(events.filter(event => event.source.session_id === 'queued' && event.content.includes('Recover this queued prompt')).length, 1);
+  const { readdirSync } = await import('node:fs');
+  assert.deepEqual(readdirSync(join(repo.stateDir, 'capture-queue')), []);
 });
 
 test('explicit host import configuration creates no automatic hooks', t => {

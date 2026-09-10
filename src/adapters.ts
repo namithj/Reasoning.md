@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { existsSync, readFileSync, realpathSync, statSync, rmSync, readdirSync } from 'node:fs';
+import { existsSync, readFileSync, realpathSync, statSync, renameSync, rmSync, readdirSync } from 'node:fs';
 import { isAbsolute, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { appendEvents, journal } from './recorder.ts';
@@ -101,7 +101,9 @@ export function parseTranscript(host: Adapter, parser: string, data: string, ses
         });
       } else if (row.type === 'system' && row.subtype === 'compact_boundary') {
         output.push(parsed(`compact:${row.uuid ?? index}`, 'compaction_boundary', 'Source reported compaction; earlier source availability must be checked.', row.timestamp));
-      } else if (!['system', 'progress', 'file-history-snapshot', 'queue-operation', 'summary', 'last-prompt'].includes(row.type)) {
+      } else if (row.type === 'attachment') {
+        output.push(parsed(`attachment:${identifier(row.uuid, 'transcript UUID')}`, 'capture_gap', 'Claude transcript attachment omitted; its visible context or hook output was not imported.', row.timestamp));
+      } else if (!['system', 'progress', 'file-history-snapshot', 'queue-operation', 'summary', 'last-prompt', 'custom-title', 'agent-name', 'atis-latch'].includes(row.type)) {
         throw new Error('Unsupported Claude transcript row type');
       }
     } else if (parser === 'copilot-events-v1') {
@@ -250,7 +252,9 @@ function finishCapture(repo: Repo) {
   rmSync(path); syncDirectory(repo.stateDir);
 }
 
-function captureNow(repo: Repo, hostName: string, raw: unknown, deliveryId?: string, spoolRedaction?: { rules: string[]; omissions: string[] }) {
+// Callers that already own the recorder lock use this to keep recovery and its
+// current delivery in one durable sequence.
+function captureNowLocked(repo: Repo, hostName: string, raw: unknown, deliveryId?: string, spoolRedaction?: { rules: string[]; omissions: string[] }) {
   const host = adapter(hostName); const value = object(raw, 'hook input') as Record<string, any>;
   const session = identifier(value.session_id ?? value.sessionId, 'session_id');
   const configured = captureState(repo).installations[host];
@@ -259,9 +263,8 @@ function captureNow(repo: Repo, hostName: string, raw: unknown, deliveryId?: str
   const event = value.hook_event_name;
   if (!['SessionStart', 'UserPromptSubmit', 'PreToolUse', 'PostToolUse', 'PostToolUseFailure', 'Stop', 'PreCompact', 'PostCompact', 'SessionEnd', 'Reconcile'].includes(event)) throw new Error('Unsupported hook event');
   const delivery = deliveryId ? identifier(deliveryId, 'delivery ID') : typeof value.timestamp === 'string' ? hash(value.timestamp + event) : randomUUID();
-  return locked(repo, () => {
-    finishCapture(repo);
-    const state = captureState(repo); const installed = state.installations[host];
+  finishCapture(repo);
+  const state = captureState(repo); const installed = state.installations[host];
     if (!installed) throw new Error('Enable this adapter before capture');
     const key = bindingKey(ADAPTERS[host].tool, session); const taskState = tasks(repo);
     const existing = state.sessions[key];
@@ -313,7 +316,7 @@ function captureNow(repo: Repo, hostName: string, raw: unknown, deliveryId?: str
       } else {
         // The transcript and current hook often expose the same tool event or most recent message.
         const paired = new Set(Object.entries(entry.aliases).filter(([key]) => key.startsWith('hook:')).map(([, id]) => id));
-        const same = transcript.find(other => !paired.has(entry.aliases[`transcript:${other.id}`]) && signature(other) === signature(item) && (item.tool_call_id !== null || item.timestamp !== null && item.timestamp === other.timestamp));
+        const same = transcript.find(other => !paired.has(entry.aliases[`transcript:${other.id}`]) && signature(other) === signature(item));
         if (same) match = entry.aliases[`transcript:${same.id}`];
       }
       if (match) { entry.aliases[alias] = match; return; }
@@ -336,8 +339,11 @@ function captureNow(repo: Repo, hostName: string, raw: unknown, deliveryId?: str
     entry.last_capture = new Date().toISOString(); entry.deliveries++; state.sessions[key] = entry;
     atomicWrite(join(repo.stateDir, 'capture-pending.json'), json({ events: incoming, state }));
     finishCapture(repo);
-    return { host, session_id: session, task_id: task, added: incoming.length, capture_status: 'partial', observed: entry.observed, gaps: entry.gaps, capture_gate: 'unverified' };
-  });
+  return { host, session_id: session, task_id: task, added: incoming.length, capture_status: 'partial', observed: entry.observed, gaps: entry.gaps, capture_gate: 'unverified' };
+}
+
+function captureNow(repo: Repo, hostName: string, raw: unknown, deliveryId?: string, spoolRedaction?: { rules: string[]; omissions: string[] }) {
+  return locked(repo, () => captureNowLocked(repo, hostName, raw, deliveryId, spoolRedaction));
 }
 
 // Each hook first writes its own sanitized queue item. A busy commit lock must not lose conversation.
@@ -372,6 +378,18 @@ export function capture(repo: Repo, hostName: string, raw: unknown, deliveryId?:
   const redaction = { rules: [...rules], omissions: [...omissions] };
   atomicWrite(path, json({ host, payload, delivery, redaction }));
   try {
+    if (payload.hook_event_name === 'SessionStart') {
+      return locked(repo, () => {
+        finishCapture(repo);
+        const current = bindingKey(ADAPTERS[host].tool, identifier(payload.session_id ?? payload.sessionId, 'session_id'));
+        // The just-written delivery stays queued until older durable work has had a chance to finish.
+        drainCaptureLocked(repo, path);
+        reconcileKnownLocked(repo, current);
+        const result = captureNowLocked(repo, host, payload, delivery, redaction);
+        rmSync(path); syncDirectory(directory);
+        return result;
+      });
+    }
     const result = captureNow(repo, host, payload, delivery, redaction);
     rmSync(path); syncDirectory(directory); return result;
   } catch (error) {
@@ -380,25 +398,49 @@ export function capture(repo: Repo, hostName: string, raw: unknown, deliveryId?:
   }
 }
 
-export function drainCapture(repo: Repo) {
+function drainCaptureLocked(repo: Repo, skip?: string) {
   const directory = join(repo.stateDir, 'capture-queue'); if (!existsSync(directory)) return [];
   const results: unknown[] = [];
   for (const file of readdirSync(directory).sort()) {
     if (!/^\d+-[0-9a-f-]{36}\.json$/.test(file)) continue;
-    const path = join(directory, file); const item = readJSON(path) as any;
-    try { results.push(captureNow(repo, item.host, item.payload, item.delivery, item.redaction)); rmSync(path); syncDirectory(directory); }
-    catch (error) { results.push({ host: item.host, queued: true, error: redact((error as Error).message).text }); }
+    const path = join(directory, file); if (path === skip) continue;
+    let item: any;
+    try { item = readJSON(path); }
+    catch (error) {
+      // Keep malformed durable input for recovery without letting it block every new session.
+      renameSync(path, path.slice(0, -'.json'.length) + '.invalid.json'); syncDirectory(directory);
+      results.push({ queued: true, quarantined: true, error: redact((error as Error).message).text });
+      continue;
+    }
+    try { results.push(captureNowLocked(repo, item.host, item.payload, item.delivery, item.redaction)); rmSync(path); syncDirectory(directory); }
+    catch (error) { results.push({ host: item?.host, queued: true, error: redact((error as Error).message).text }); }
   }
   return results;
 }
 
-export function reconcile(repo: Repo) {
-  const results = drainCapture(repo); const state = captureState(repo);
-  for (const entry of Object.values(state.sessions)) {
-    if (!entry.transcript) continue;
-    results.push(capture(repo, entry.host, { hook_event_name: 'Reconcile', session_id: entry.session, cwd: repo.root, transcript_path: entry.transcript }, 'reconcile'));
+function reconcileKnownLocked(repo: Repo, skip?: string) {
+  const results: unknown[] = [];
+  for (const [key, entry] of Object.entries(captureState(repo).sessions)) {
+    if (key === skip || !entry.transcript) continue;
+    try {
+      results.push(captureNowLocked(repo, entry.host, { hook_event_name: 'Reconcile', session_id: entry.session, cwd: repo.root, transcript_path: entry.transcript }, 'reconcile'));
+    } catch (error) {
+      // A damaged old source must not prevent the new session's durable delivery.
+      results.push({ host: entry.host, session_id: entry.session, error: redact((error as Error).message).text });
+    }
   }
   return results;
+}
+
+export function drainCapture(repo: Repo) {
+  return locked(repo, () => { finishCapture(repo); return drainCaptureLocked(repo); });
+}
+
+export function reconcile(repo: Repo) {
+  return locked(repo, () => {
+    finishCapture(repo);
+    return [...drainCaptureLocked(repo), ...reconcileKnownLocked(repo)];
+  });
 }
 
 export function captureCheck(repo: Repo, hostName: string, session: string, prompt: string, reply: string) {

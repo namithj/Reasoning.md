@@ -5,7 +5,7 @@ description: Configure Reasoning.md, save explicit decisions, inspect recorded d
 
 Use the installed `reasoning` CLI from the target Git worktree. Run `reasoning --help` for the command surface and `reasoning doctor` for local health. Report CLI failures and distinguish capture health from commit-inclusion health. Enabling a host adapter is configuration, not proof that its extension panel was tested.
 
-For requested setup, initialize the selected repository with an explicit publication policy, start a named task, and enable the requested host adapter. Preserve existing configuration. Saved conversation inherits repository visibility. Use the user's already-given scope and authorization; installation does not authorize committing or publishing. Raw history from unrelated sessions is outside scope.
+For requested setup, run `reasoning setup --host HOST --publication private|public` in the selected repository. It installs assistant and ordinary Git commit capture while preserving existing policy, tasks, bindings, unrelated hooks and customized skills. Setup stages, commits and pushes nothing; installation does not authorize any of those actions. Saved conversation inherits repository visibility, and raw history from unrelated sessions remains outside scope.
 
 For an explicit decision, call `reasoning decision "..." --task ID` with the user's stated rationale and alternatives. Do not label an invented retrospective explanation as an original conversation. An assistant-authored decision is an explicit new entry, not recovered hidden reasoning.
 

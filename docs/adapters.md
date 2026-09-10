@@ -2,42 +2,32 @@
 
 An adapter connects Reasoning.md to the conversation data your assistant exposes. Capture is experimental and may be incomplete; check a real exchange before relying on it.
 
-Run setup commands in your project's Git directory or its workspace parent, in the same environment as your assistant. Initialize the project first if needed:
+Run one setup command in the same environment where the assistant and Git run:
 
 ```sh
-reasoning init --publication private
+reasoning setup --host codex --publication private
 ```
 
-Use `--publication public` for records intended for public sharing. Neither setting changes GitHub visibility or encrypts your records.
+Replace `codex` with `claude-code`, `copilot-vscode` or `copilot-cli`. Use `--publication public` only for conversations intended for public sharing, and add `--repo PATH` when workspace discovery is ambiguous. Neither publication setting changes repository visibility or encrypts records.
 
-If the workspace contains one nested Git worktree, `init` finds the nearest worktree and stores the parent/worktree binding in local Git state. If several worktrees are found at the same depth, no files are changed; rerun with `--repo PATH`. Re-running `init` updates already-enabled adapter hooks to use the stored binding without enabling new adapters.
+Setup initializes and binds the repository, selects a persistent default task, installs the companion skill, writes the assistant hook configuration and installs native Git hooks. It stages and commits nothing. Run it once per checkout and environment because generated launchers contain local absolute paths. Re-running it repairs owned hook files while preserving policy, active tasks, bindings, unrelated hooks and customized skills.
+
+After setup, open or resume the assistant in the project. A supported `SessionStart` automatically retries queued deliveries and rereads known transcripts before later prompt, tool and reply hooks continue capture. Opening an editor folder without starting an assistant session is not a universal capture event.
+
+Codex requires you to inspect and trust the exact project hook with [`/hooks`](https://learn.chatgpt.com/docs/hooks) once. Setup cannot grant that trust. Other hosts may need a reload when already open. Keep Reasoning.md installed at a persistent path, and rerun setup if Node, the CLI, repository or workspace moves.
+
+Run `reasoning doctor` after a real exchange. It reports disabled host hooks, missing launchers and changed Git hook selection with repair guidance. On Windows, automatic capture is supported for Claude Code and Copilot CLI; use explicit imports for the other hosts.
 
 ## Claude Code or Codex
 
-Choose the commands for your assistant. Claude Code supports direct executable setup on Linux, macOS and Windows. Codex shell-hook setup currently supports Linux and macOS.
-
-**Claude Code:**
+The one-command setup above is the normal path. The individual commands remain useful for recovery or a deliberately partial installation:
 
 ```sh
-reasoning adapter enable claude-code
-reasoning skill install --host claude-code
-```
-
-**Codex:**
-
-```sh
+reasoning init --publication private
 reasoning adapter enable codex
 reasoning skill install --host codex
+reasoning hooks install
 ```
-
-The adapter configures capture. The optional skill gives your assistant instructions for finding and using saved history. Reload your assistant as required by its hook settings, then inspect the setup:
-
-```sh
-reasoning doctor
-reasoning adapter list
-```
-
-Keep Reasoning.md installed at a persistent location: generated hook commands contain absolute paths. They also pass the selected repository explicitly, so a hook launched from a workspace parent writes to the correct worktree. Reconfigure the adapter if the Node, CLI or repository location moves. Existing unrelated hook commands and settings are preserved. Hosts such as Codex may require reviewing the hook again when its generated command changes.
 
 ## Other assistants and platforms
 
@@ -51,7 +41,7 @@ Keep Reasoning.md installed at a persistent location: generated hook commands co
 | Codex desktop | `codex-desktop` | Explicit rollout-file import |
 | ChatGPT | `chatgpt-export` | Explicit import of one exported conversation branch |
 
-Use `reasoning adapter enable ADAPTER_NAME` for another hook-based adapter. Live assistant-panel compatibility remains unverified. Test one adapter at a time: some assistants load overlapping hook settings, which can cause duplicate or misattributed capture.
+Use `reasoning adapter enable ADAPTER_NAME` for another hook-based adapter. Live VS Code panel capture was verified on 10 September 2026 in a Linux remote environment for Claude Code 2.1.267 and Codex 26.903.61454. The Claude Code exchange included a prompt, reply, tool call and tool result; the Codex exchange included a prompt and reply with no tool use. Both saved records were verified as `partial`. This evidence applies only to those observed builds and does not establish complete capture. Test one adapter at a time: some assistants load overlapping hook settings, which can cause duplicate or misattributed capture.
 
 **Windows:** automatic configuration is implemented for Claude Code and Copilot CLI using Node’s executable and a literal argument array. Codex, Copilot VS Code and cloud adapters still require explicit imports on Windows. Real Windows panel/runtime compatibility remains unverified here; the generated direct launchers are exercised by tests that also run in Windows CI.
 
@@ -75,7 +65,7 @@ Use `reasoning adapter enable ADAPTER_NAME` for another hook-based adapter. Live
 
 Replace `HOST` with your adapter name. Compare the saved prompt, reply and tool activity with what you actually saw. The command exits with status 1 when any of those four elements is missing. Run reconciliation again to check that the exchange is not duplicated.
 
-`doctor` checks the recorded workspace and repository roots, whether the generated hook commands are still present at the workspace configuration path, whether the recorded Node/CLI paths remain readable, and whether Git still uses the installed hook directory. It also reports the most recent capture separately from live-panel verification. Neither it nor the capture check certifies complete conversation capture. To check commit inclusion too, follow the [commit guide](controlled-commits.md) and run `reasoning verify HEAD`.
+`doctor` checks the recorded workspace and repository roots, whether the generated hook commands are still present at the workspace configuration path, whether the recorded Node/CLI paths remain readable, and whether Git still uses the installed hook directory. It also reports the most recent capture separately from live-panel verification. Its generic runtime status remains unverified because the product cannot infer manual test provenance. Neither it nor the capture check certifies complete conversation capture. To check commit inclusion too, follow the [commit guide](controlled-commits.md) and run `reasoning verify HEAD`.
 
 ## Explicit imports
 

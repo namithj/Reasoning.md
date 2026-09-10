@@ -31,6 +31,30 @@ export function formatOutput(command: string, value: any, format: OutputFormat =
   let next = '';
   let data = value;
   switch (command) {
+    case 'setup': {
+      const automaticReady = value.setup_health?.adapters?.[value.host]?.capture_configuration_ready === true && value.setup_health?.git?.automatic_commit_configuration_ready === true;
+      summary = automaticReady ? 'Automatic conversation and ordinary Git commit capture are ready for ' + value.host + '.'
+        : 'Setup installed Reasoning.md for ' + value.host + ', but automatic capture still needs attention.';
+      data = { repository: value.workspace?.repository_root, workspace: value.workspace?.workspace_root, publication: value.publication,
+        active_task: value.task?.task_id, assistant_capture_configured: Boolean(value.adapter?.configured),
+        companion_skill_installed: Boolean(value.skill?.installed), customized_skill_preserved: Boolean(value.skill?.preserved),
+        native_git_hooks_installed: Boolean(value.git_hooks?.installed), automatic_capture_ready: automaticReady, staged_by_setup: value.staged_by_setup, runtime_verified: value.runtime_verified };
+      const steps = [
+        'Open or resume a supported assistant session in this workspace. Session startup and later hooks capture and reconcile known conversation data automatically.',
+        value.host === 'codex' ? 'In Codex, review and trust this project hook once with /hooks; setup cannot bypass that trust gate.' : 'Reload the assistant if it was already open so it reads the new hook configuration.',
+        'On the first commit, stage .ai-history/config.json with your code. Then use your ordinary git add and git commit routine; setup staged nothing.',
+        'Committed conversation records are readable by everyone who receives the repository.',
+        'Run reasoning doctor after a real assistant exchange and commit. Configuration alone does not prove live assistant or editor execution.',
+      ];
+      if (value.skill?.warning) steps.unshift(value.skill.warning);
+      const adapterHealth = value.setup_health?.adapters?.[value.host];
+      if (adapterHealth?.hooks_enabled === false) steps.unshift('Assistant hooks are disabled by the host settings. Enable hooks there, then run reasoning setup again.');
+      else if (adapterHealth && adapterHealth.capture_configuration_ready === false) steps.unshift('Assistant capture configuration is incomplete. Run reasoning doctor for the exact failed paths, then rerun reasoning setup.');
+      if (value.setup_health?.git?.automatic_commit_configuration_ready === false) steps.unshift('Automatic Git commit capture is incomplete. Run reasoning doctor, repair core.hooksPath or launcher access as reported, then rerun reasoning setup.');
+      if (value.other_task_ids?.length) steps.push('Other tasks remain unchanged. Run reasoning task list if pending history belongs to another task.');
+      next = steps.join('\n');
+      break;
+    }
     case 'init':
       summary = value.workspace?.discovery === 'descendant'
         ? `Project initialized in nested Git worktree ${value.workspace.repository_root}.`
@@ -60,13 +84,21 @@ export function formatOutput(command: string, value: any, format: OutputFormat =
         local_state: value.local_state, recorder_executable: value.recorder_executable, node_executable: value.node_executable,
       };
       const steps = [];
-      if (!value.initialized) steps.push('Run reasoning init --publication private to set up this project.');
+      if (!value.initialized) steps.push('Run reasoning setup --host HOST --publication private to set up automatic capture for this project.');
       else {
         if (value.recorder?.lock_present) steps.push('A recorder lock exists. Confirm its process has stopped before attempting recovery; do not delete live state.');
         if (value.recorder?.pending_transaction) steps.push('A commit transaction is pending. Inspect it with reasoning doctor and follow the recovery guide before retrying.');
-        if (!Object.keys(installations).length) steps.push('No adapters are configured. Enable your assistant with reasoning adapter enable HOST, or import a supported transcript.');
+        if (!Object.keys(installations).length) steps.push('No adapters are configured. Run reasoning setup --host HOST --publication ' + (value.recorder?.publication ?? 'private') + ', or use a supported transcript import.');
         else if (!value.recorder?.events) steps.push('No events have been captured yet. Test a prompt, reply and tool call in your assistant, then run reasoning reconcile.');
         if (value.recorder?.queued_capture_deliveries || sessions.some(session => session.gaps?.length)) steps.push('Capture needs attention. Run reasoning reconcile, then compare the saved exchange with your assistant.');
+        for (const [host, adapter] of Object.entries(value.health?.adapters ?? {}) as [string, any][]) {
+          if (adapter.hooks_enabled === false) steps.push(host + ': host settings disable hooks. Enable hooks in ' + (adapter.config_path ?? 'the host settings') + ', then run reasoning setup again.');
+          else if (adapter.capture_configuration_ready === false) steps.push(host + ': capture files or launchers are missing or unreadable. Run reasoning adapter enable ' + host + ' to repair them.');
+        }
+        const gitHealth = value.health?.git;
+        if (gitHealth && !gitHealth.configured) steps.push('Ordinary Git commits are not connected. Run reasoning hooks install.');
+        else if (gitHealth?.hooks_path_matches === false) steps.push('Git core.hooksPath changed. Restore the Reasoning.md hook path reported below, then run reasoning hooks install.');
+        else if (gitHealth?.automatic_commit_configuration_ready === false) steps.push('Git hook files or launchers are missing or not executable. Run reasoning hooks install to repair them.');
       }
       steps.push('Detected extensions and configured adapters do not prove live capture. Assistant-panel compatibility remains unverified.');
       next = steps.join('\n');
@@ -97,8 +129,8 @@ export function formatOutput(command: string, value: any, format: OutputFormat =
       next = 'Run reasoning doctor for project configuration and capture status.';
       break;
     case 'skill':
-      summary = `Companion skill installed for ${value.host}.`;
-      next = 'Reload your assistant if needed so it can discover the skill. Skill installation does not enable capture.';
+      summary = value.preserved ? 'Existing customized companion skill preserved for ' + value.host + '.' : 'Companion skill installed for ' + value.host + '.';
+      next = value.warning ?? 'Reload your assistant if needed so it can discover the skill. Skill installation does not enable capture.';
       break;
     case 'import':
     case 'capture':

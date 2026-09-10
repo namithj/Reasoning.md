@@ -1,28 +1,30 @@
 # Save conversations with commits
 
-Use `reasoning commit` to save a conversation record alongside your staged code changes. You need Node.js 24+, Git 2.43+ and an [initialized project with capture or imported history](adapters.md).
+After [one-command setup](adapters.md), ordinary staged Git commits automatically save available conversation records. You need Node.js 24+ and Git 2.43+. The `reasoning commit` wrapper remains available when you need an explicit task, previewed transaction, amend or coverage override.
 
 ## Make a commit
 
 Stage your intended changes and include the configuration on the first commit:
 
 ```sh
-reasoning reconcile
 git add .ai-history/config.json path/to/changed-file
-reasoning preview --staged
-```
-
-Replace the file path with your own. Review the preview for private information and missing exchanges, then commit:
-
-```sh
-reasoning commit -m "Describe your change"
+git commit -m "Describe your change"
 reasoning verify HEAD
 reasoning show HEAD
 ```
 
+Replace the file path with your own. The native hooks reconcile known capture before creating and attaching a record. Setup does not stage the first configuration for you. Review committed records for private information; anyone who receives the repository can read them.
+
+For an explicit preview or task selection, use:
+
+```sh
+reasoning preview --staged --task TASK_ID
+reasoning commit -m "Describe your change" --task TASK_ID
+```
+
 Reasoning.md adds its record files to your staged changes, preserves unstaged edits and runs existing Git hooks. It does not push anything. If you change the Reasoning.md configuration later, stage that change before committing too.
 
-If more than one task is present, use `reasoning task list` to find the right ID and add `--task TASK_ID` to both preview and commit.
+Setup keeps one active task for routine commits. Use `reasoning task list` and `--task TASK_ID` when you intentionally switch or recover older task-bound work.
 
 For work done without an assistant, you can explicitly attest to that:
 
@@ -47,9 +49,9 @@ Verification checks the record's integrity and association with the committed ch
 
 Do not edit previously committed record files or stage standalone `reasoning export` snapshots as commit records. Use `reasoning commit` to create a new record.
 
-## Optional: use ordinary Git commits
+## Advanced: repair ordinary Git commit integration
 
-To attach records when you run an ordinary staged `git commit`, install native hooks:
+The setup command installs native hooks. To install or repair only that part:
 
 ```sh
 reasoning hooks install

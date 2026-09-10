@@ -26,7 +26,7 @@ test('interactive results explain next steps while pipes and explicit JSON prese
 test('doctor distinguishes initialization, configuration and capture without dumping internal aliases', () => {
   const missing = formatOutput('doctor', { initialized: false, hosts: [] }, 'text');
   assert.match(missing, /not been initialized/);
-  assert.match(missing, /reasoning init --publication private/);
+  assert.match(missing, /reasoning setup --host HOST --publication private/);
   const empty = formatOutput('doctor', { initialized: true, recorder: state, capture: { installations: {}, sessions: {} }, hosts: [] }, 'text');
   assert.match(empty, /No adapters are configured/);
   const pending = formatOutput('doctor', {
@@ -93,4 +93,52 @@ test('CLI format selection and hook failures work without any Git writes', t => 
   assert.equal(hook.status, 0);
   assert.equal(hook.stdout, '');
   assert.match(hook.stderr, /^reasoning:/);
+});
+
+
+test("setup output distinguishes installed configuration from runtime verification", () => {
+  const ready = formatOutput("setup", {
+    host: "codex", publication: "private",
+    workspace: { repository_root: "/repo", workspace_root: "/repo" },
+    task: { task_id: "task-1" }, adapter: { configured: true }, skill: { installed: true }, git_hooks: { installed: true },
+    setup_health: {
+      adapters: { codex: { hooks_enabled: true, capture_configuration_ready: true } },
+      git: { automatic_commit_configuration_ready: true },
+    },
+    staged_by_setup: false, runtime_verified: false,
+  }, "text");
+  assert.match(ready, /are ready for codex/);
+  assert.match(ready, /\/hooks/);
+  assert.match(ready, /setup staged nothing/);
+  assert.match(ready, /everyone who receives the repository/);
+  assert.match(ready, /does not prove live assistant or editor execution/);
+
+  const attention = formatOutput("setup", {
+    host: "claude-code", workspace: {}, task: {}, adapter: { configured: true },
+    skill: { preserved: true, warning: "Customized skill preserved" }, git_hooks: { installed: true },
+    setup_health: {
+      adapters: { "claude-code": { hooks_enabled: false, capture_configuration_ready: false } },
+      git: { automatic_commit_configuration_ready: false },
+    },
+  }, "text");
+  assert.match(attention, /still needs attention/);
+  assert.match(attention, /hooks are disabled/);
+  assert.match(attention, /Customized skill preserved/);
+  assert.doesNotMatch(attention, /are ready/);
+});
+
+test("doctor gives commands for disabled adapters and Git hook drift", () => {
+  const report = formatOutput("doctor", {
+    initialized: true, recorder: state,
+    capture: { installations: { "claude-code": { parser: "claude-jsonl-v1", config_path: ".claude/settings.local.json" } }, sessions: {} },
+    health: {
+      adapters: { "claude-code": { hooks_enabled: false, capture_configuration_ready: false, config_path: ".claude/settings.local.json" } },
+      git: { configured: true, hooks_path_matches: false, automatic_commit_configuration_ready: false },
+    },
+    hosts: [],
+  }, "text");
+  assert.match(report, /settings disable hooks/);
+  assert.match(report, /reasoning setup again/);
+  assert.match(report, /core\.hooksPath changed/);
+  assert.match(report, /reasoning hooks install/);
 });

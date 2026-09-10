@@ -24,9 +24,8 @@ try {
   const git = (...args) => run('git', args, cwd);
   const reasoning = (...args) => run(process.execPath, [cli, ...args], cwd);
   git('init', '-b', 'main'); git('config', 'user.name', 'Package Check'); git('config', 'user.email', 'test@example.invalid'); git('config', 'commit.gpgsign', 'false');
-  reasoning('init', '--publication', 'private');
-  const task = JSON.parse(reasoning('task', 'start', 'Packaged end-to-end check'));
-  reasoning('adapter', 'enable', 'claude-code');
+  const setup = JSON.parse(reasoning('setup', '--host', 'claude-code', '--publication', 'private'));
+  const task = setup.task;
   const hook = JSON.parse(readFileSync(join(cwd, '.claude/settings.local.json'), 'utf8')).hooks.UserPromptSubmit[0].hooks[0];
   assert.equal(execFileSync(hook.command, hook.args, { cwd, env, encoding: 'utf8', input: JSON.stringify({ hook_event_name: 'UserPromptSubmit', session_id: 'package-host', cwd, prompt: 'Packaged direct capture', timestamp: '2026-09-08T00:00:00Z' }) }), '');
   reasoning('import', '--input', resolve('test/fixtures/conversation.jsonl'));
@@ -39,7 +38,7 @@ try {
   assert.equal(JSON.parse(reasoning('verify', 'HEAD')).verified, true);
   assert.equal(git('show', 'HEAD:code.txt'), 'staged\n');
   assert.equal(readFileSync(join(cwd, 'code.txt'), 'utf8'), 'unstaged\n');
-  reasoning('hooks', 'install'); git('add', 'code.txt'); git('commit', '-m', 'Packaged native hook');
+  git('add', 'code.txt'); git('commit', '-m', 'Packaged native hook');
   assert.equal(JSON.parse(reasoning('verify', 'HEAD')).verified, true);
   const clone = join(directory, 'clone'); git('clone', cwd, clone);
   const fromClone = (...args) => run(process.execPath, [cli, ...args], clone);

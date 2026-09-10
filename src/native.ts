@@ -2,7 +2,7 @@ import { spawnSync } from 'node:child_process';
 import { chmodSync, existsSync, readFileSync, rmSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { atomicWrite, config, git, locked, privateDirectory, syncDirectory, repository } from './storage.ts';
+import { atomicWrite, config, git, locked, privateDirectory, samePath, syncDirectory, repository } from './storage.ts';
 import type { Repo } from './storage.ts';
 import { cleanFailed, finalize, head, installedNative, pending, prepareCommit, runHook } from './commits.ts';
 import { reconcile } from './adapters.ts';
@@ -10,6 +10,7 @@ import { tasks } from './history.ts';
 import { json } from './schema.ts';
 
 const NATIVE_HOOKS = ['pre-merge-commit', 'pre-commit', 'prepare-commit-msg', 'commit-msg', 'post-commit', 'reference-transaction'];
+const sameHookPath = (actual: string, expected: string) => resolve(actual) === resolve(expected) || (() => { try { return samePath(actual, expected); } catch { return false; } })();
 const DELEGATED_HOOKS = ['applypatch-msg', 'pre-applypatch', 'post-applypatch', 'pre-rebase', 'post-checkout', 'post-merge', 'pre-push', 'pre-receive', 'update', 'proc-receive', 'post-receive', 'post-update', 'push-to-checkout', 'pre-auto-gc', 'post-rewrite', 'sendemail-validate', 'fsmonitor-watchman', 'p4-changelist', 'p4-prepare-changelist', 'p4-post-changelist', 'p4-pre-submit', 'post-index-change'];
 
 export function installNative(repo: Repo) {
@@ -21,7 +22,7 @@ export function installNative(repo: Repo) {
     if (scope.stdout?.startsWith('worktree\t')) throw new Error('A worktree-specific hook manager needs a manual integration; repository hooks were not changed');
     const prior = spawnSync('git', ['config', '--local', '--get', 'core.hooksPath'], { cwd: repo.root, encoding: 'utf8' });
     const original_hooks = existing?.original_hooks ?? git(repo.root, ['rev-parse', '--path-format=absolute', '--git-path', 'hooks']).trim();
-    if (existing && resolve(git(repo.root, ['rev-parse', '--path-format=absolute', '--git-path', 'hooks']).trim()) !== resolve(existing.directory)) throw new Error('Hook configuration changed since installation; resolve it before reinstalling');
+    if (existing && !sameHookPath(git(repo.root, ['rev-parse', '--path-format=absolute', '--git-path', 'hooks']).trim(), existing.directory)) throw new Error('Hook configuration changed since installation; resolve it before reinstalling');
     privateDirectory(directory);
     const cli = fileURLToPath(new URL(import.meta.url.endsWith('.ts') ? './cli.ts' : './cli.js', import.meta.url));
     const quote = (value: string) => "'" + value.replaceAll("'", "'\\''") + "'";
@@ -44,7 +45,7 @@ export function uninstallNative(repo: Repo) {
   return locked({ ...repo, stateDir: repo.commonState }, () => {
     const state = installedNative(repo); if (!state) return { installed: false };
     const actual = git(repo.root, ['rev-parse', '--path-format=absolute', '--git-path', 'hooks']).trim();
-    if (resolve(actual) !== resolve(state.directory)) throw new Error('Hook configuration changed; refusing to overwrite it');
+    if (!sameHookPath(actual, state.directory)) throw new Error('Hook configuration changed; refusing to overwrite it');
     for (const field of git(repo.root, ['worktree', 'list', '--porcelain', '-z']).split('\0')) {
       if (field.startsWith('worktree ') && existsSync(join(repository(field.slice(9)).stateDir, 'transaction.json'))) throw new Error('Recover pending transactions in every worktree before removing native hooks');
     }

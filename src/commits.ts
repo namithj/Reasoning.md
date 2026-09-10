@@ -214,12 +214,15 @@ export function commitPreview(repo: Repo, task?: string, noActivity = false, bas
     inherited.manifest.capture_boundary.event_ids.forEach(id => excludeIds.add(id));
   }
 
-  task ??= tasks(repo).active ?? undefined;
-  const selectedTask = task ?? journal(repo)[0]?.task_id ?? null;
+  const pendingEvents = journal(repo).filter(event => !excludeIds.has(event.event_id));
+  const activeTask = tasks(repo).active;
+  task ??= activeTask ?? (new Set(pendingEvents.map(event => event.task_id)).size === 1 ? pendingEvents[0]?.task_id : undefined);
+  const selectedTask = task ?? null;
   const relevant = priorRecords.filter(previous => previous.task_id === selectedTask);
   const alreadyReferenced = new Set(relevant.flatMap(previous => previous.referenced_records));
   const references = relevant.filter(previous => !alreadyReferenced.has(previous.record_id)).map(previous => previous.record_id);
-  const record = snapshot(repo, task, { commit: true, excludeIds, references: [...new Set([...references, ...Object.keys(preservedRecords)])], noActivity, base });
+  const record = snapshot(repo, task, { commit: true, excludeIds, references: [...new Set([...references, ...Object.keys(preservedRecords)])], noActivity, base,
+    allowEmptyTask: task !== undefined && task === activeTask });
   record.manifest.preserved_records = preservedRecords;
   if (Object.keys(preservedRecords).length) {
     record.reasoning += `\nPreserved source records: ${Object.keys(preservedRecords).join(', ')}\n`;

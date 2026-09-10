@@ -27,6 +27,22 @@ export function listTasks(repo: Repo): Tasks {
 }
 
 export const bindingKey = (host: string, session: string) => JSON.stringify([host, session]);
+export function ensureDefaultTask(repo: Repo) {
+  return locked(repo, () => {
+    const state = tasks(repo);
+    if (state.active) {
+      if (!state.tasks[state.active]) throw new Error('Active task is missing from local task state');
+      return { task_id: state.active, ...state.tasks[state.active] };
+    }
+    const existing = Object.keys(state.tasks);
+    const id = existing.length === 1 ? existing[0] : randomUUID();
+    if (!state.tasks[id]) state.tasks[id] = { title: 'Project development', created_at: new Date().toISOString() };
+    state.active = id;
+    atomicWrite(join(repo.stateDir, 'tasks.json'), json(state));
+    return { task_id: id, ...state.tasks[id] };
+  });
+}
+
 
 export function startTask(repo: Repo, title: string) {
   if (!title.trim() || title.length > 4096) throw new Error('Task title must contain 1–4096 characters');

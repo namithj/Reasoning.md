@@ -7,7 +7,7 @@ import { bindWorkspace, config, discoverProject, initialize, repository } from '
 import { installSkill, setPolicy, verifyRange } from './team.ts';
 import { installNative, uninstallNative, nativeHook } from './native.ts';
 import { ADAPTERS, capture, captureState, enableAdapter, reconcile, captureCheck } from './adapters.ts';
-import { startTask, resumeTask, bindTask, tasks, listTasks, decision, search, context, explain } from './history.ts';
+import { startTask, resumeTask, bindTask, tasks, listTasks, decision, search, context, explain, ensureDefaultTask } from './history.ts';
 import { commit, amendmentBase, commitPreview, recover, runHook, show, verify } from './commits.ts';
 import { HOSTS, probe, health } from './probe.ts';
 import { INPUT_LIMIT, VERSION } from './schema.ts';
@@ -19,14 +19,14 @@ let outputFormat: OutputFormat = 'auto';
 const help = `Reasoning.md ${VERSION} — experimental development conversation archive
 
 Get started in your Git project:
-  reasoning init --publication private    Prepare local storage and project configuration
-  reasoning adapter enable HOST          Connect your assistant (claude-code or codex)
-  reasoning doctor                       Inspect setup, capture gaps and next steps
+  reasoning setup --host codex --publication private    Configure automatic capture and ordinary Git commits
+  reasoning doctor                                      Inspect setup, capture gaps and next steps
 
-Initialization does not enable capture. Windows setup supports claude-code and copilot-cli;
+Setup supports claude-code, codex, copilot-vscode and copilot-cli. Windows automatic capture supports claude-code and copilot-cli;
 use supported transcript imports for other Windows hosts. Run reasoning --version to check your installation.
 
 Commands:
+  reasoning setup --host HOST --publication private|public [--repo PATH]
   reasoning init --publication private|public [--repo PATH]
   reasoning import --input events.jsonl|- 
   reasoning status
@@ -61,8 +61,8 @@ Output:
 Requires Node.js 24+ and Git. A sole nested worktree is discovered automatically; use --repo PATH when a workspace contains several.
 Import accepts normalized JSONL v1 or a declared host transcript with --host HOST --session ID.
 Export creates an untracked snapshot; it never stages, commits or consumes events.
-Host capture and native Git hooks are opt-in; real IDE compatibility remains unverified.
-The controlled commit wrapper runs only when you invoke reasoning commit.
+Host capture and native Git hooks are opt-in when using init alone; setup installs both. Real assistant and editor runtime compatibility remains unverified.
+The controlled commit wrapper remains available for explicit previews, task selection and overrides.
 Public exports are readable by everyone receiving the repository. Review before sharing.
 `;
 
@@ -111,7 +111,7 @@ async function main() {
     adapter: ['parser', 'surface', 'host-version', 'extension-version', 'session', 'prompt', 'reply'],
     capture: ['input', 'delivery-id'], reconcile: [], task: ['task'], decision: ['task'], search: [], context: ['task', 'limit'], explain: ['file'],
     commit: ['amend', 'message', 'task', 'no-assistant-activity', 'allow-partial'], recover: [], show: [], verify: [],
-    init: ['publication'], import: ['input', 'host', 'session'], status: [], preview: ['staged', 'task', 'amend'],
+    setup: ['host', 'publication'], init: ['publication'], import: ['input', 'host', 'session'], status: [], preview: ['staged', 'task', 'amend'],
     export: ['staged', 'task'], probe: ['input', 'extension-dir'], doctor: ['extension-dir'],
   };
   if (!Object.hasOwn(allowed, command)) throw new Error('Unknown command; run reasoning --help');
@@ -128,6 +128,47 @@ async function main() {
     output(probe(host, cwd, payload, values['extension-dir'])); return;
   }
   const project = discoverProject(process.cwd(), values.repo); const repo = project.repo;
+  if (command === 'setup') {
+    const setupHost = values.host ?? ''; const publication = values.publication ?? '';
+    const supported = ['claude-code', 'codex', 'copilot-vscode', 'copilot-cli'];
+    if (!supported.includes(setupHost)) throw new Error('Setup requires --host claude-code, codex, copilot-vscode or copilot-cli');
+    if (!['public', 'private'].includes(publication)) throw new Error('Choose --publication public or --publication private; exported conversations inherit repository access');
+    if (process.platform === 'win32' && !['claude-code', 'copilot-cli'].includes(setupHost)) throw new Error('Automatic Windows setup is available for claude-code and copilot-cli; use explicit imports for this host');
+    const configPath = join(repo.root, '.ai-history', 'config.json');
+    if (existsSync(configPath)) {
+      const existing = config(repo);
+      if (existing.publication !== publication) throw new Error('Existing publication policy differs; review and edit config.json explicitly');
+      const currentHealth = health(repo);
+      if (currentHealth.git.configured && currentHealth.git.hooks_path_matches === false
+        && resolve(currentHealth.git.effective_hooks_path!) !== resolve(currentHealth.git.expected_hooks_path!)) throw new Error('Git hook configuration changed since installation; run reasoning doctor and resolve core.hooksPath before setup');
+    }
+    const completed: string[] = [];
+    try {
+      const initialized = initialize(repo, publication); completed.push('project initialization');
+      const workspace = bindWorkspace(repo, project.workspaceRoot, project.discovery); completed.push('workspace binding');
+      const task = ensureDefaultTask(repo); completed.push('default task selection');
+      const installed = captureState(repo).installations; const reconfigured_adapters: string[] = [];
+      for (const [name, adapterSetup] of Object.entries(installed)) {
+        if (name === setupHost) continue;
+        enableAdapter(repo, name, { parser: adapterSetup.parser, surface: adapterSetup.surface, hostVersion: adapterSetup.host_version ?? undefined,
+          extensionVersion: adapterSetup.extension_version ?? undefined, workspaceRoot: workspace.workspace_root });
+        reconfigured_adapters.push(name);
+      }
+      const previous = installed[setupHost];
+      const adapter = enableAdapter(repo, setupHost, { parser: previous?.parser, surface: previous?.surface === 'import' ? undefined : previous?.surface,
+        hostVersion: previous?.host_version ?? undefined, extensionVersion: previous?.extension_version ?? undefined, workspaceRoot: workspace.workspace_root }); completed.push('assistant capture');
+      const skill = installSkill(repo, setupHost, true); completed.push(skill.installed ? 'companion skill' : 'custom companion skill preserved');
+      const git_hooks = installNative(repo); completed.push('Git commit hooks');
+      const setup_health = health(repo);
+      const taskState = tasks(repo);
+      output({ configured: true, host: setupHost, publication: initialized.publication, workspace, task, adapter, skill, git_hooks, setup_health,
+        reconfigured_adapters, other_task_ids: Object.keys(taskState.tasks).filter(id => id !== task.task_id), staged_by_setup: false, runtime_verified: false });
+      return;
+    } catch (error) {
+      const progress = completed.length ? ' Completed: ' + completed.join(', ') + '.' : '';
+      throw new Error('Setup stopped: ' + (error instanceof Error ? error.message : 'unexpected failure') + '.' + progress + ' Completed changes were kept; run reasoning doctor before retrying.');
+    }
+  }
   if (command === 'init') {
     const initialized = initialize(repo, values.publication ?? '');
     const workspace = bindWorkspace(repo, project.workspaceRoot, project.discovery);

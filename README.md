@@ -6,7 +6,7 @@ The npm package is `@namithj/reasoning.md`; the command is `reasoning`.
 
 Save accessible development conversations alongside the Git commits they explain. Records contain readable text, structured events, source references and a fingerprint of the staged code. No cloud service, model call or external dependency is required.
 
-**0.1.0-alpha.5 · MIT · experimental.** Includes host capture, durable reconciliation, controlled commits, opt-in native Git hooks, decision capture, cited task handoffs and a reusable CI verifier. Real extension-panel and Source Control compatibility remain unverified. Copilot VS Code imports and reconciles v1 session-event transcripts, including full exposed replies and tool activity. See [adapter scope and limitations](docs/adapters.md) and the [implementation and acceptance status](docs/implementation-status.md).
+**0.1.0-alpha.5 · MIT · experimental.** Includes host capture, durable reconciliation, controlled commits, opt-in native Git hooks, decision capture, cited task handoffs and a reusable CI verifier. Live VS Code panel capture has been verified in a Linux remote environment for Claude Code 2.1.267 (prompt, reply, tool call and tool result) and Codex 26.903.61454 (prompt and reply); both records remain partial. Source Control compatibility remains unverified. Copilot VS Code imports and reconciles v1 session-event transcripts, including full exposed replies and tool activity. See [adapter scope and limitations](docs/adapters.md) and the [implementation and acceptance status](docs/implementation-status.md).
 
 ## Install
 
@@ -38,44 +38,30 @@ If you already have a compiled package, you can install it directly with `npm in
 
 ## How to Use
 
-Open a terminal in your existing Git project or its workspace parent and initialize it:
+Run setup once from your Git project or a workspace parent:
 
 ```sh
-reasoning init --publication private
+reasoning setup --host codex --publication private
 ```
 
-When the current directory is not a Git checkout, `init` discovers a sole nested worktree such as `public/.git`, records the workspace-to-repository binding locally, and configures enabled adapters against that workspace. If several repositories are found at the nearest depth, select one with `--repo PATH`. Use `--publication public` instead for records intended for public sharing. Then choose the setup for your assistant below. Claude Code and Copilot CLI use direct executable hooks on Linux, macOS and Windows; other automatic adapters currently use Linux/macOS shell hooks.
+Replace `codex` with `claude-code`, `copilot-vscode` or `copilot-cli`. On Windows, automatic setup currently supports `claude-code` and `copilot-cli`; use explicit imports for the other hosts. Use `--publication public` only when the saved conversation is intended for public sharing. If a workspace contains several repositories, add `--repo PATH`.
 
-### Claude Code
+Setup initializes the repository, selects a persistent project task, configures the assistant adapter and companion skill, and installs native Git hooks. It does not stage, commit or push anything. Run it once for each checkout and execution environment because generated hooks use local absolute paths. A repeat run repairs Reasoning.md owned hooks and preserves repository policy, the active task, session bindings, unrelated hooks and customized companion skills.
+
+After setup, open or resume a supported assistant session in the project. Session startup and later assistant hooks automatically capture visible conversation and reconcile known transcripts. A bare editor folder-open with no assistant session is not a universal host event. In Codex, use `/hooks` to review and trust the exact project hook once; setup cannot bypass that trust decision.
+
+
+Use the normal Git routine. Include the tracked configuration on the first commit:
 
 ```sh
-reasoning adapter enable claude-code
-reasoning skill install --host claude-code
+git add .ai-history/config.json path/to/changed-file
+git commit -m "Describe your change"
+reasoning verify HEAD
 ```
 
-### Copilot in VS Code
+Later commits only need the files you intended to stage. Native hooks reconcile capture, add the conversation record and trailer, and preserve unrelated staging and executable hooks. Everyone who receives the repository can read committed records, including records made with the private publication policy. That policy describes the intended audience; it is not encryption or Git access control.
 
-```sh
-reasoning adapter enable copilot-vscode
-reasoning skill install --host copilot-vscode
-```
-
-### Codex
-
-```sh
-reasoning adapter enable codex
-reasoning skill install --host codex
-```
-
-The adapter configures conversation capture; the skill gives your assistant instructions for using saved history. Reload your assistant as required by its hook settings, then check the setup:
-
-```sh
-reasoning doctor
-```
-
-`doctor` reports configuration and capture gaps; verify a real exchange with the [capture check](docs/adapters.md#verify-capture). On Windows, Claude Code and Copilot CLI support automatic setup; use [transcript imports](docs/adapters.md#explicit-imports) for other hosts until their Windows launchers are verified.
-
-When you are ready to save a conversation with your changes, follow the [commit guide](docs/controlled-commits.md).
+Run `reasoning doctor` after a real exchange and commit. It checks current hook files and launchers and provides repair steps. Configuration alone does not prove that an assistant panel or editor Commit button executed the hooks. `reasoning reconcile`, the individual `init`/`adapter`/`skill`/`hooks` commands and `reasoning commit` remain available for recovery and advanced workflows. See [assistant setup](docs/adapters.md) and the [commit guide](docs/controlled-commits.md).
 
 ## Retrieve the discussion
 
@@ -108,7 +94,8 @@ Run these commands as `reasoning COMMAND` from the initialized repository or its
 
 | Command | What it does |
 | --- | --- |
-| `init --publication private [--repo PATH]` | Discover and initialize the project; use `public` for records intended for public sharing. |
+| `setup --host HOST --publication private\|public [--repo PATH]` | Configure automatic assistant capture and ordinary Git commits in one step. |
+| `init --publication private [--repo PATH]` | Advanced: initialize storage without enabling new capture. |
 | `doctor` | Report configuration, assistant environment and capture gaps. |
 | `status` | Show captured events, sessions, queued deliveries and pending work. |
 | `adapter enable HOST` | Configure capture for an assistant. |
